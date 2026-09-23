@@ -222,6 +222,7 @@ or environment variable is needed** — the program only reads a local file.
 | `get_workout_insight` | One workout compared against your own baseline, with the baseline window, sample count and confidence |
 | `get_metric_series` | A per-day metric series, each carrying its `unit` |
 | `get_sleep_detail` | One night in detail, stage durations in minutes |
+| `get_sleep_for_date` | All sleep sessions ending on a specified local date, using an IANA timezone |
 | `get_data_health` | Fetch/parse/write state and coverage per stream |
 
 `get_data_health` deserves a mention of its own: it lets a model tell the
@@ -248,6 +249,8 @@ letting it receive an empty series and guess:
   paths.
 
 `zeppbridge-cli contract` prints the same definitions.
+
+Generated MCP tool descriptions, health labels, and diagnostic messages are in English. Stored measurements and user-entered labels are returned as data without translation.
 
 ## Running alongside the desktop app
 

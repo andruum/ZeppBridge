@@ -44,12 +44,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::TimeZone;
 use serde_json::{json, Value};
 use zeppbridge_core::contract;
 use zeppbridge_core::paths;
 use zeppbridge_core::storage::Database;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const MCP_TIME_CONVENTION: &str = "All timestamps are RFC 3339 and include a timezone offset. Cloud fetch times (synced_at / fetched_at) differ from sample times (start_time / timestamp) and must not be substituted for one another.";
+const MCP_MISSING_VALUE_CONVENTION: &str = "No sample means missing: a field is null or the segment is absent. Missing values are never filled with zero, a previous value, or an estimate. Fewer points than days in a series means those days have no recorded data.";
+const MCP_SOURCE_CONVENTION: &str = "source_scope identifies the source: device means reported by a specific watch, user_fused means combined by Zepp Cloud across devices, and unknown means undetermined. unknown is never treated as device data.";
+const MCP_PRIVACY_NOTE: &str = "Read-only access to the local SQLite database. The server does not contact Zepp, open a listening port, or return credentials or absolute local paths.";
 
 /// 现代（无握手）协议版本。
 const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -139,12 +144,18 @@ fn main() {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
             Err(error) => {
-                eprintln!("Could not start the async runtime: {error}");
+                eprintln!(
+                    "Could not start the async runtime: {}",
+                    english_diagnostic(error.to_string())
+                );
                 std::process::exit(1);
             }
         };
         if let Err(error) = runtime.block_on(serve_http()) {
-            eprintln!("MCP HTTP server failed: {error}");
+            eprintln!(
+                "MCP HTTP server failed: {}",
+                english_diagnostic(error.to_string())
+            );
             std::process::exit(1);
         }
         return;
@@ -156,7 +167,10 @@ fn main() {
     let stdin = io::stdin();
     let stdout = io::stdout();
     if let Err(error) = serve(&mut stdin.lock(), &mut stdout.lock()) {
-        eprintln!("MCP stdio server failed: {error}");
+        eprintln!(
+            "MCP stdio server failed: {}",
+            english_diagnostic(error.to_string())
+        );
         std::process::exit(1);
     }
 }
@@ -410,12 +424,182 @@ fn server_info() -> Value {
 /// 时，最容易做的事就是当成 0。
 fn instructions() -> String {
     format!(
-        "ZeppBridge 只读健康数据。{}\n时间：{}\n缺失值：{}\n来源：{}",
-        contract::PRIVACY_NOTE,
-        contract::TIME_CONVENTION,
-        contract::MISSING_VALUE_CONVENTION,
-        contract::SOURCE_CONVENTION,
+        "ZeppBridge provides read-only health data. {}\nTime: {}\nMissing values: {}\nSources: {}",
+        MCP_PRIVACY_NOTE, MCP_TIME_CONVENTION, MCP_MISSING_VALUE_CONVENTION, MCP_SOURCE_CONVENTION,
     )
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+}
+
+fn english_diagnostic(message: String) -> String {
+    if contains_cjk(&message) {
+        "The operation failed. See the local ZeppBridge diagnostics for details.".into()
+    } else {
+        message
+    }
+}
+
+fn english_stream_label(stream: &str) -> String {
+    match stream {
+        "heart_rate" => "Heart rate".into(),
+        "daily_summary" => "Daily summary".into(),
+        "sleep" => "Sleep".into(),
+        "hrv" => "Heart rate variability".into(),
+        "wellness" => "Wellness metrics".into(),
+        "workouts" => "Workouts".into(),
+        "workout_detail" => "Workout details and routes".into(),
+        "weight" => "Weight and body composition".into(),
+        "vo2max" => "VO2 max".into(),
+        "lactate_threshold_hr" => "Lactate threshold heart rate".into(),
+        "lactate_threshold_pace" => "Lactate threshold pace".into(),
+        "resting_heart_rate" => "Resting heart rate".into(),
+        "training_load" => "Training load".into(),
+        "blood_oxygen" => "Blood oxygen".into(),
+        "breathing_rate" => "Breathing rate".into(),
+        "skin_temperature" => "Skin temperature".into(),
+        other => other
+            .split('_')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn english_coverage_note(coverage: &Value, cadence: &str) -> String {
+    match coverage["kind"].as_str().unwrap_or_default() {
+        "observations" if cadence == "per_event" => {
+            "Event-driven data: no record means no matching activity was recorded, not a data gap.".into()
+        }
+        "observations" => {
+            "This metric is recorded occasionally; blank dates are expected and do not indicate missing data.".into()
+        }
+        _ if coverage["observed_days"].as_i64().unwrap_or(0) == 0 => {
+            "No local data was observed in this time window.".into()
+        }
+        _ if coverage["gap_total"].as_i64().unwrap_or(0) == 0 => {
+            "No gaps were observed between the first and latest recorded dates.".into()
+        }
+        _ => format!(
+            "No data was observed on {} date(s) between the first and latest recorded dates. This may occur if the device was not worn, a sync did not run, or the source returned no data.",
+            coverage["gap_total"].as_i64().unwrap_or(0)
+        ),
+    }
+}
+
+fn english_data_health(mut health: Value) -> Value {
+    for list_name in ["streams", "occasional_metrics"] {
+        if let Some(streams) = health[list_name].as_array_mut() {
+            for stream in streams {
+                let stream_id = stream["stream"].as_str().unwrap_or_default().to_string();
+                stream["label"] = json!(english_stream_label(&stream_id));
+                let cadence = stream["cadence"].as_str().unwrap_or_default().to_string();
+                if let Some(coverage) = stream.get_mut("coverage") {
+                    let note = english_coverage_note(coverage, &cadence);
+                    coverage["note"] = json!(note);
+                }
+                for stage_name in ["fetch", "parse", "write"] {
+                    if let Some(stage) = stream.get_mut(stage_name) {
+                        if stage["message"].as_str().is_some_and(contains_cjk) {
+                            let error_kind =
+                                stage["error_kind"].as_str().unwrap_or_default().to_string();
+                            let message = match error_kind.as_str() {
+                                "auth" => "Authentication failed. Reconnect the Zepp account.",
+                                "not_available" => "The source does not provide this data for the account or device.",
+                                "network" => "The network request failed.",
+                                "unrecognized_payload" => "The returned payload could not be interpreted.",
+                                _ => "The operation failed. See the local ZeppBridge diagnostics for details.",
+                            };
+                            stage["message"] = json!(message);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(actions) = health["actions"].as_array_mut() {
+        for action in actions {
+            let (label, reason) = match action["code"].as_str().unwrap_or_default() {
+                "reauth" => ("Reconnect Zepp account", "Authentication failed for one or more data streams."),
+                "reprocess" => ("Reprocess stored local payloads", "Stored payloads are pending normalization. Reprocessing is local and does not contact Zepp or change cloud sync timestamps."),
+                "sync_retry" => ("Retry sync", "One or more data streams could not be fetched from Zepp."),
+                "sync_first" => ("Run first sync", "No successful cloud sync has been recorded on this device."),
+                "integrity_check" => ("Check database integrity", "Run SQLite integrity_check on the local database; this may take time for a large database."),
+                "open_data_folder" => ("Open data folder", "The local database, backups, and exports are stored there."),
+                _ => continue,
+            };
+            action["label"] = json!(label);
+            action["reason"] = json!(reason);
+        }
+    }
+    if let Some(object) = health.as_object_mut() {
+        for value in object.values_mut() {
+            scrub_cjk_strings(value);
+        }
+    }
+    health
+}
+
+fn scrub_cjk_strings(value: &mut Value) {
+    match value {
+        Value::String(text) if contains_cjk(text) => {
+            *text =
+                "Non-English diagnostic text was omitted; see local ZeppBridge diagnostics.".into();
+        }
+        Value::Array(items) => items.iter_mut().for_each(scrub_cjk_strings),
+        Value::Object(object) => object.values_mut().for_each(scrub_cjk_strings),
+        _ => {}
+    }
+}
+
+fn english_workout_insight(mut insight: Value) -> Value {
+    let unsupported = match insight["unsupported_code"].as_str().unwrap_or_default() {
+        "unsupported_workout_type" => Some("This workout type is not currently supported."),
+        _ => None,
+    };
+    if let Some(reason) = unsupported {
+        insight["unsupported_reason"] = json!(reason);
+    } else if insight["unsupported_reason"]
+        .as_str()
+        .is_some_and(contains_cjk)
+    {
+        insight["unsupported_reason"] =
+            json!("This workout type is not currently supported; see unsupported_code.");
+    }
+    if let Some(facts) = insight["facts"].as_array_mut() {
+        for fact in facts {
+            let reason = match fact["reason_code"].as_str().unwrap_or_default() {
+                "weekly_zero_baseline" | "workout_zero_baseline" => Some(
+                    "The previous baseline mean is zero, so relative change cannot be computed.",
+                ),
+                "weekly_thin_baseline" => Some(
+                    "There are too few baseline days with data to make a comparison; only the current value is reported.",
+                ),
+                "weekly_no_recent_data" => Some(
+                    "No data for this metric was recorded locally in the last 7 days.",
+                ),
+                "workout_thin_baseline" => Some(
+                    "Too few comparable historical workouts have this metric; only the current value is reported.",
+                ),
+                "workout_no_value" => Some("This workout has no value for this metric."),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                fact["reason"] = json!(reason);
+            } else if fact["reason"].as_str().is_some_and(contains_cjk) {
+                fact["reason"] = json!("The comparison could not be completed; see the reason_code and evidence fields.");
+            }
+        }
+    }
+    insight
 }
 
 /// 请求的 `_meta` 里声明的协议版本。没有就说明这是个 legacy 客户端。
@@ -494,7 +678,7 @@ fn handle(method: &str, params: &Value) -> Result<Value, RpcError> {
             // 把两个时代混着用，明确说清楚比默默照办好。
             other => Err(RpcError::new(
                 ERR_METHOD_NOT_FOUND,
-                format!("不支持的方法：{other}。本服务只提供只读工具调用。"),
+                format!("Unsupported method: {other}. This server only provides read-only tools."),
             )),
         };
     }
@@ -520,7 +704,7 @@ fn handle(method: &str, params: &Value) -> Result<Value, RpcError> {
         "tools/call" => call_tool(params).map_err(RpcError::from),
         other => Err(RpcError::new(
             ERR_METHOD_NOT_FOUND,
-            format!("不支持的方法：{other}。本服务只提供只读工具调用。"),
+            format!("Unsupported method: {other}. This server only provides read-only tools."),
         )),
     }
 }
@@ -528,13 +712,13 @@ fn handle(method: &str, params: &Value) -> Result<Value, RpcError> {
 /* ------------------------------ 工具定义 ------------------------------ */
 
 fn tool_definitions() -> Vec<Value> {
-    let missing = contract::MISSING_VALUE_CONVENTION;
-    let time = contract::TIME_CONVENTION;
+    let missing = MCP_MISSING_VALUE_CONVENTION;
+    let time = MCP_TIME_CONVENTION;
     vec![
         json!({
             "name": "list_workouts",
             "description": format!(
-                "列出本机已保存的运动记录，最新在前。距离单位米，时长由起止时间给出，心率单位 bpm。{missing}"
+                "List locally saved workouts, newest first. Distance is in metres, duration is determined from start/end timestamps, and heart rate is in bpm. {missing}"
             ),
             "inputSchema": {
                 "type": "object",
@@ -544,7 +728,7 @@ fn tool_definitions() -> Vec<Value> {
                         "minimum": 1,
                         "maximum": 200,
                         "default": 20,
-                        "description": "返回多少条，最多 200。"
+                        "description": "Number of records to return (maximum 200)."
                     }
                 },
                 "additionalProperties": false
@@ -553,14 +737,13 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "get_workout_insight",
             "description": format!(
-                "对一次运动给出确定性事实：与个人基线的比较、基线窗口、样本数和置信度。\
-                 只返回事实与证据，不生成任何自然语言结论。基线样本不足时返回 facts 为空并说明原因，\
-                 不会为了凑一句话而降低门槛。{missing}"
+                "Return deterministic facts for one workout, including comparison with the user's baseline, baseline window, sample count, and confidence.\
+                 Return facts and evidence only; do not generate conclusions. If the baseline has too few samples, report the reason rather than lowering the threshold. {missing}"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workoutId": { "type": "string", "description": "list_workouts 返回的 workoutId。" }
+                    "workoutId": { "type": "string", "description": "The workoutId returned by list_workouts." }
                 },
                 "required": ["workoutId"],
                 "additionalProperties": false
@@ -569,7 +752,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "get_metric_series",
             "description": format!(
-                "按天取一条或多条指标序列。单位见每个 series 的 unit 字段。{missing} {time}"
+                "Return one or more per-day metric series. Units are given by each series' unit field. {missing} {time}"
             ),
             "inputSchema": {
                 "type": "object",
@@ -578,14 +761,14 @@ fn tool_definitions() -> Vec<Value> {
                         "type": "array",
                         "items": { "type": "string", "enum": contract::metric_names() },
                         "minItems": 1,
-                        "description": "指标名。未知指标会被忽略而不是报错。"
+                        "description": "Metric names. Unknown metrics are ignored."
                     },
                     "days": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 1825,
                         "default": 90,
-                        "description": "往回多少天，含今天。"
+                        "description": "Number of days to look back, including today."
                     }
                 },
                 "required": ["metrics"],
@@ -595,31 +778,42 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "get_sleep_detail",
             "description": format!(
-                "取一晚睡眠的明细。分期时长单位分钟；设备没有上报的分期不会出现，也不会补 0。{missing}"
+                "Return one night's sleep details. Stage durations are in minutes. Stages not reported by the device are omitted, not filled with zero. {missing}"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "sleepId": { "type": "string", "description": "睡眠记录 id。省略则返回最近一晚。" }
+                    "sleepId": { "type": "string", "description": "Sleep record ID. If omitted, return the most recent night." }
                 },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "get_sleep_for_date",
+            "description": format!(
+                "Return all sleep sessions assigned to the requested local sleep date, using the local date on which each session ends.\
+                 Requires an ISO date and IANA timezone; the result may contain zero or multiple sessions.\
+                 Stage durations are in minutes; missing stages are not filled with zero. {missing} {time}"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sleepDate": { "type": "string", "format": "date", "description": "Local sleep date, YYYY-MM-DD." },
+                    "timezone": { "type": "string", "description": "IANA timezone, for example Europe/Berlin." }
+                },
+                "required": ["sleepDate", "timezone"],
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "get_data_health",
             "description": format!(
-                "本机数据的健康状况：每条流的抓取/解析/写入三个阶段各自的状态、\
-                 覆盖情况和最近一次成功时间。用它判断一个问题「查不到」是因为没同步，\
-                 还是因为那段时间本来就没数据。\
-                 `pending_normalization` 只统计当前解析器尚未处理的报文。\
-                 `normalization_by_stream` 按流统计 pending、normalized、\
-                 processed_without_output（解析完成但无输出，不保证已识别）和 quarantined（解析失败已隔离）；\
-                 后两者不应被当作反复重放就能消除的积压。\
-                 `normalizer_replay_pending` 为真时，历史记录需要重放\
-                 （`stored_normalizer_revision` 是哪一版，`normalizer_revision` 是当前版）——\
-                 此时运动类型、睡眠阶段这类派生字段可能过时，回答里应当说明这一点。\
-                 修正的办法是在那台机器上跑一次 `zeppbridge-cli reprocess`，\
-                 或者启动一次桌面应用；这个服务只读，做不了。{time} {missing}"
+                "Report local data health: fetch, parse, and write states, coverage, and last-success times for each stream.\
+                 Use it to distinguish data that was not synced from data that was absent in the period.\
+                 `pending_normalization` counts raw payloads not yet processed by the current normalizer.\
+                 `normalization_by_stream` reports pending, normalized, processed_without_output (processed with no output; not necessarily recognized), and quarantined (parse failed and was quarantined) counts per stream.\
+                 `normalizer_replay_pending` means historical records need replay; compare `stored_normalizer_revision` with `normalizer_revision`. Derived fields such as workout type and sleep stages may be stale until replayed.\
+                 Replay locally with `zeppbridge-cli reprocess` or launch the desktop app; this read-only server cannot perform replay. {time} {missing}"
             ),
             "inputSchema": {
                 "type": "object",
@@ -629,7 +823,7 @@ fn tool_definitions() -> Vec<Value> {
                         "minimum": 1,
                         "maximum": 365,
                         "default": 30,
-                        "description": "用多长的窗口判断覆盖。"
+                        "description": "Coverage lookback window in days."
                     }
                 },
                 "additionalProperties": false
@@ -641,21 +835,25 @@ fn tool_definitions() -> Vec<Value> {
 /* ------------------------------ 工具调用 ------------------------------ */
 
 fn open_db() -> Result<(Database, u64), (i64, String)> {
-    let dir = paths::resolve_data_dir()
-        .map_err(|error| (ERR_DATABASE, format!("无法确定数据目录：{error}")))?;
+    let dir = paths::resolve_data_dir().map_err(|error| {
+        (
+            ERR_DATABASE,
+            format!("Cannot determine the data directory: {error}"),
+        )
+    })?;
     let db_path = dir.join("zepp.db");
     if !db_path.exists() {
         return Err((
             ERR_NOT_CONFIGURED,
-            "本机还没有 ZeppBridge 数据库。请先在桌面应用里连接账号并同步一次。".into(),
+            "No ZeppBridge database exists on this machine. Connect the account and sync once in the desktop app.".into(),
         ));
     }
     let bytes = std::fs::metadata(&db_path)
         .map(|meta| meta.len())
         .unwrap_or(0);
     // query_only 连接：写操作在 SQLite 层就被拒绝，只读不是靠这里的分支保证的。
-    let db =
-        Database::open_read_only(db_path).map_err(|error| (ERR_DATABASE, error.user_message()))?;
+    let db = Database::open_read_only(db_path)
+        .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
     Ok((db, bytes))
 }
 
@@ -670,7 +868,7 @@ fn call_tool_with_db(
     let name = params
         .get("name")
         .and_then(Value::as_str)
-        .ok_or((ERR_INVALID_PARAMS, "缺少工具名".to_string()))?;
+        .ok_or((ERR_INVALID_PARAMS, "Missing tool name.".to_string()))?;
     if !tool_definitions()
         .iter()
         .any(|tool| tool["name"].as_str() == Some(name))
@@ -686,7 +884,7 @@ fn call_tool_with_db(
     match execute_tool_with_db(name, params, open) {
         Ok(result) => Ok(result),
         Err((_code, message)) => Ok(json!({
-            "content": [{"type":"text", "text":message}],
+            "content": [{"type":"text", "text":english_diagnostic(message)}],
             "isError": true,
         })),
     }
@@ -709,7 +907,7 @@ fn execute_tool_with_db(
                 .clamp(1, 200) as usize;
             let workouts = db
                 .get_recent_workouts(limit)
-                .map_err(|error| (ERR_DATABASE, error.user_message()))?;
+                .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
             json!({
                 "workouts": workouts.iter().map(|workout| json!({
                     "workoutId": workout.workout_id,
@@ -726,19 +924,24 @@ fn execute_tool_with_db(
                     "sampleCount": workout.sample_count,
                 })).collect::<Vec<_>>(),
                 "units": { "distance": "m", "heartRate": "bpm", "calories": "kcal" },
-                "missingValues": contract::MISSING_VALUE_CONVENTION,
+                "missingValues": MCP_MISSING_VALUE_CONVENTION,
             })
         }
         "get_workout_insight" => {
             let workout_id = args
                 .get("workoutId")
                 .and_then(Value::as_str)
-                .ok_or((ERR_INVALID_PARAMS, "缺少 workoutId".to_string()))?;
+                .ok_or((ERR_INVALID_PARAMS, "Missing workoutId.".to_string()))?;
             let insight = db
                 .workout_insight(workout_id)
-                .map_err(|error| (ERR_DATABASE, error.user_message()))?;
-            serde_json::to_value(insight)
-                .map_err(|error| (ERR_DATABASE, format!("序列化失败：{error}")))?
+                .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
+            let insight = serde_json::to_value(insight).map_err(|error| {
+                (
+                    ERR_DATABASE,
+                    format!("Failed to serialize tool result: {error}"),
+                )
+            })?;
+            english_workout_insight(insight)
         }
         "get_metric_series" => {
             let metrics: Vec<String> = args
@@ -753,37 +956,39 @@ fn execute_tool_with_db(
                 })
                 .unwrap_or_default();
             if metrics.is_empty() {
-                return Err((ERR_INVALID_PARAMS, "metrics 不能为空".into()));
+                return Err((ERR_INVALID_PARAMS, "metrics must not be empty.".into()));
             }
             let days = args.get("days").and_then(Value::as_i64).unwrap_or(90);
             let series = db
                 .metric_series(&metrics, days)
-                .map_err(|error| (ERR_DATABASE, error.user_message()))?;
+                .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
             json!({
                 "series": serde_json::to_value(&series)
-                    .map_err(|error| (ERR_DATABASE, format!("序列化失败：{error}")))?,
+                    .map_err(|error| (ERR_DATABASE, format!("Failed to serialize tool result: {error}")))?,
                 "requestedMetrics": metrics,
-                "missingValues": contract::MISSING_VALUE_CONVENTION,
-                "time": contract::TIME_CONVENTION,
+                "missingValues": MCP_MISSING_VALUE_CONVENTION,
+                "time": MCP_TIME_CONVENTION,
             })
         }
         "get_sleep_detail" => {
             let session = match args.get("sleepId").and_then(Value::as_str) {
                 Some(id) => db
                     .get_sleep_detail(id)
-                    .map_err(|error| (ERR_DATABASE, error.user_message()))?,
+                    .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?,
                 None => {
                     let latest = db
                         .get_recent_sleep_sessions(1)
-                        .map_err(|error| (ERR_DATABASE, error.user_message()))?
+                        .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?
                         .into_iter()
                         .next();
                     // The list deliberately omits stages; load the same detail
                     // as an explicit sleepId instead of returning that summary.
                     match latest {
-                        Some(session) => db
-                            .get_sleep_detail(&session.sleep_id)
-                            .map_err(|error| (ERR_DATABASE, error.user_message()))?,
+                        Some(session) => {
+                            db.get_sleep_detail(&session.sleep_id).map_err(|error| {
+                                (ERR_DATABASE, english_diagnostic(error.user_message()))
+                            })?
+                        }
                         None => None,
                     }
                 }
@@ -791,14 +996,75 @@ fn execute_tool_with_db(
             match session {
                 Some(session) => json!({
                     "sleep": serde_json::to_value(&session)
-                        .map_err(|error| (ERR_DATABASE, format!("序列化失败：{error}")))?,
+                        .map_err(|error| (ERR_DATABASE, format!("Failed to serialize tool result: {error}")))?,
                     "units": { "stageMinutes": "min", "heartRate": "bpm" },
-                    "missingValues": contract::MISSING_VALUE_CONVENTION,
+                    "missingValues": MCP_MISSING_VALUE_CONVENTION,
                 }),
                 // 「本机没有这一晚」和「这一晚没有数据」是同一句话：
                 // 不返回一个各项为 0 的空壳。
-                None => json!({ "sleep": Value::Null, "reason": "本机没有匹配的睡眠记录。" }),
+                None => {
+                    json!({ "sleep": Value::Null, "reason": "No matching sleep record was found locally." })
+                }
             }
+        }
+        "get_sleep_for_date" => {
+            let date_text = args
+                .get("sleepDate")
+                .and_then(Value::as_str)
+                .ok_or((ERR_INVALID_PARAMS, "Missing sleepDate (YYYY-MM-DD).".into()))?;
+            let date = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d").map_err(|_| {
+                (
+                    ERR_INVALID_PARAMS,
+                    "sleepDate must use YYYY-MM-DD format.".into(),
+                )
+            })?;
+            let timezone_text = args
+                .get("timezone")
+                .and_then(Value::as_str)
+                .ok_or((ERR_INVALID_PARAMS, "Missing IANA timezone.".into()))?;
+            let timezone = timezone_text.parse::<chrono_tz::Tz>().map_err(|_| {
+                (
+                    ERR_INVALID_PARAMS,
+                    "timezone must be a valid IANA timezone.".into(),
+                )
+            })?;
+            let next_date = date.succ_opt().ok_or((
+                ERR_INVALID_PARAMS,
+                "sleepDate is outside the supported range.".into(),
+            ))?;
+            let local_boundary = |day: chrono::NaiveDate| {
+                let local = day.and_hms_opt(0, 0, 0).ok_or_else(|| {
+                    (
+                        ERR_INVALID_PARAMS,
+                        "Could not construct the local date boundary.".into(),
+                    )
+                })?;
+                match timezone.from_local_datetime(&local) {
+                    chrono::LocalResult::Single(value) => Ok(value.with_timezone(&chrono::Utc)),
+                    chrono::LocalResult::Ambiguous(first, second) => {
+                        Ok(first.min(second).with_timezone(&chrono::Utc))
+                    }
+                    chrono::LocalResult::None => Err((
+                        ERR_INVALID_PARAMS,
+                        "Local midnight does not exist in this timezone, so the date boundary is ambiguous.".into(),
+                    )),
+                }
+            };
+            let start = local_boundary(date)?;
+            let end = local_boundary(next_date)?;
+            let sessions = db
+                .get_sleep_sessions_ending_between(start, end)
+                .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
+            json!({
+                "sleepDate": date_text,
+                "timezone": timezone_text,
+                "assignment": "local date on which the sleep session ends",
+                "sessions": serde_json::to_value(&sessions)
+                    .map_err(|error| (ERR_DATABASE, format!("Failed to serialize tool result: {error}")))?,
+                "units": { "stageMinutes": "min", "heartRate": "bpm" },
+                "missingValues": MCP_MISSING_VALUE_CONVENTION,
+                "time": MCP_TIME_CONVENTION,
+            })
         }
         "get_data_health" => {
             let window = args
@@ -808,14 +1074,21 @@ fn execute_tool_with_db(
                 .clamp(1, 365);
             let health = db
                 .data_health(window, database_bytes)
-                .map_err(|error| (ERR_DATABASE, error.user_message()))?;
-            serde_json::to_value(health)
-                .map_err(|error| (ERR_DATABASE, format!("序列化失败：{error}")))?
+                .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
+            let health = serde_json::to_value(health).map_err(|error| {
+                (
+                    ERR_DATABASE,
+                    format!("Failed to serialize tool result: {error}"),
+                )
+            })?;
+            english_data_health(health)
         }
         other => {
             return Err((
                 ERR_METHOD_NOT_FOUND,
-                format!("没有名为 {other} 的工具。本服务只提供只读查询。"),
+                format!(
+                    "No tool named {other} exists. This server only provides read-only queries."
+                ),
             ))
         }
     };
@@ -917,14 +1190,15 @@ mod tests {
         }
 
         fn call_sleep(&self, arguments: Value) -> Value {
-            call_tool_with_db(
-                &json!({ "name": "get_sleep_detail", "arguments": arguments }),
-                || {
-                    let db = Database::open_read_only(self.0.join("zepp.db"))
-                        .map_err(|error| (ERR_DATABASE, error.user_message()))?;
-                    Ok((db, 0))
-                },
-            )
+            self.call_tool("get_sleep_detail", arguments)
+        }
+
+        fn call_tool(&self, name: &str, arguments: Value) -> Value {
+            call_tool_with_db(&json!({ "name": name, "arguments": arguments }), || {
+                let db = Database::open_read_only(self.0.join("zepp.db"))
+                    .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
+                Ok((db, 0))
+            })
             .unwrap()
         }
     }
@@ -966,6 +1240,51 @@ mod tests {
     }
 
     #[test]
+    fn tool_definitions_and_server_instructions_are_english() {
+        let schema = serde_json::to_string(&tool_definitions()).unwrap();
+        assert!(!contains_cjk(&schema));
+        assert!(!contains_cjk(&instructions()));
+    }
+
+    #[test]
+    fn diagnostic_errors_with_non_english_text_are_safely_rendered_in_english() {
+        let text = english_diagnostic("数据不可用: 响应 items 为空".into());
+        assert_eq!(
+            text,
+            "The operation failed. See the local ZeppBridge diagnostics for details."
+        );
+        assert!(!contains_cjk(&text));
+    }
+
+    #[test]
+    fn data_health_tool_output_translates_localized_generated_text() {
+        let library = TestLibrary::new(&[]);
+        let result = library.call_tool("get_data_health", json!({ "windowDays": 7 }));
+        assert_eq!(result["isError"], json!(false));
+        let output = serde_json::to_string(&result["structuredContent"]).unwrap();
+        assert!(
+            !contains_cjk(&output),
+            "MCP health output must be English: {output}"
+        );
+    }
+
+    #[test]
+    fn workout_insight_output_uses_stable_reason_codes_in_english() {
+        let insight = json!({
+            "unsupported_reason": "此运动类型暂不支持。",
+            "unsupported_code": "unsupported_workout_type",
+            "facts": [{
+                "reason": "最近 7 天本机没有这项数据。",
+                "reason_code": "weekly_no_recent_data"
+            }]
+        });
+        let output = serde_json::to_string(&english_workout_insight(insight)).unwrap();
+        assert!(!contains_cjk(&output));
+        assert!(output.contains("This workout type is not currently supported."));
+        assert!(output.contains("No data for this metric was recorded locally in the last 7 days."));
+    }
+
+    #[test]
     fn latest_sleep_returns_the_same_full_detail_as_an_explicit_id() {
         let older = sleep_session("older", 1, Some("light"));
         let latest = sleep_session("latest", 2, Some("deep"));
@@ -989,6 +1308,50 @@ mod tests {
             previous["structuredContent"]["sleep"]["stages"][0]["stage"],
             "light"
         );
+    }
+
+    #[test]
+    fn get_sleep_for_date_uses_local_end_date_and_iana_timezone() {
+        let mut matching = sleep_session("night-ending-jan-2", 1, Some("light"));
+        matching.start_time = Utc.with_ymd_and_hms(2026, 1, 1, 23, 30, 0).unwrap();
+        matching.end_time = Utc.with_ymd_and_hms(2026, 1, 2, 0, 30, 0).unwrap();
+        let mut next_day = sleep_session("night-ending-jan-3", 2, None);
+        next_day.start_time = Utc.with_ymd_and_hms(2026, 1, 2, 22, 30, 0).unwrap();
+        next_day.end_time = Utc.with_ymd_and_hms(2026, 1, 2, 23, 30, 0).unwrap();
+        let library = TestLibrary::new(&[matching, next_day]);
+
+        let result = library.call_tool(
+            "get_sleep_for_date",
+            json!({ "sleepDate": "2026-01-02", "timezone": "Europe/Berlin" }),
+        );
+        assert_eq!(result["isError"], json!(false));
+        assert_eq!(
+            result["structuredContent"]["sleepDate"],
+            json!("2026-01-02")
+        );
+        assert_eq!(
+            result["structuredContent"]["sessions"][0]["sleep_id"],
+            json!("night-ending-jan-2")
+        );
+        assert_eq!(
+            result["structuredContent"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn get_sleep_for_date_rejects_invalid_date_and_timezone() {
+        let library = TestLibrary::new(&[]);
+        for args in [
+            json!({ "sleepDate": "yesterday", "timezone": "Europe/Berlin" }),
+            json!({ "sleepDate": "2026-01-02", "timezone": "Mars/Olympus" }),
+        ] {
+            let result = library.call_tool("get_sleep_for_date", args);
+            assert_eq!(result["isError"], json!(true));
+        }
     }
 
     #[test]
@@ -1016,8 +1379,8 @@ mod tests {
             let description = tool["description"].as_str().unwrap_or_default();
             let name = tool["name"].as_str().unwrap_or_default();
             assert!(
-                description.contains("不会用 0") || description.contains("不会补 0"),
-                "{name} 的说明没有讲清缺失值规则"
+                description.contains("Missing values are never filled"),
+                "{name} does not explain the missing-value rule"
             );
             assert!(
                 tool["inputSchema"]["additionalProperties"] == json!(false),
@@ -1043,7 +1406,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
     }
 
     #[test]
@@ -1058,8 +1421,8 @@ mod tests {
     fn initialize_tells_the_caller_the_privacy_boundary_up_front() {
         let result = handle("initialize", &json!({})).unwrap();
         let instructions = result["instructions"].as_str().unwrap();
-        assert!(instructions.contains("不监听端口"));
-        assert!(instructions.contains("不会用 0"));
+        assert!(instructions.contains("does not contact Zepp"));
+        assert!(instructions.contains("never filled with zero"));
         assert_eq!(result["serverInfo"]["version"], json!(VERSION));
     }
 
@@ -1090,7 +1453,7 @@ mod tests {
         assert!(result["instructions"]
             .as_str()
             .unwrap()
-            .contains("不监听端口"));
+            .contains("does not contact Zepp"));
         assert_eq!(result["cacheScope"], json!("public"));
     }
 
@@ -1103,7 +1466,7 @@ mod tests {
         assert_eq!(result["resultType"], json!("complete"));
         assert!(result["ttlMs"].as_i64().unwrap() > 0);
         assert_eq!(result["cacheScope"], json!("public"));
-        assert_eq!(result["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(result["tools"].as_array().unwrap().len(), 6);
     }
 
     /// 认不出来的版本必须明确拒绝，并**把我们支持的版本列出来**——客户端就

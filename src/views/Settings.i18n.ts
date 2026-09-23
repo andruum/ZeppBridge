@@ -157,7 +157,7 @@ export const settingsMessages = defineMessages(
 - MCP 程序要从 ZeppBridge 的 GitHub Release 页下载 zeppbridge-tools 压缩包，解压后里面有 zeppbridge-mcp 可执行文件。我可能还没下载。
 - 它是 stdio 类型的 MCP server，只读本机数据库，不联网、不监听端口、不需要任何 token 或 API key。
 - 典型配置形状是：{"mcpServers": {"zeppbridge": {"command": "<zeppbridge-mcp 的完整路径>", "args": []}}}
-- 它提供五个只读工具：list_workouts（运动列表）、get_workout_insight（单次运动与个人基线的比较）、get_metric_series（按天的指标序列）、get_sleep_detail（一晚睡眠明细）、get_data_health（每条数据流的抓取/解析/写入状态）。
+- 它提供六个只读工具：list_workouts（运动列表）、get_workout_insight（单次运动与个人基线的比较）、get_metric_series（按天的指标序列）、get_sleep_detail（一晚睡眠明细）、get_sleep_for_date（按本地日期和 IANA 时区查询睡眠）和 get_data_health（每条数据流的抓取/解析/写入状态）。
 
 请告诉我：
 1. 针对你（我现在正在用的这个工具）具体应该把配置写到哪个文件、用什么命令添加；
@@ -560,7 +560,7 @@ What I know about it:
 - The MCP program comes from the zeppbridge-tools archive on ZeppBridge's GitHub Releases page; unzip it and zeppbridge-mcp is inside. I may not have downloaded it yet.
 - It is a stdio MCP server. It reads the local database, does not use the network, listens on no port, and needs no token or API key.
 - The typical config shape is: {"mcpServers": {"zeppbridge": {"command": "<full path to zeppbridge-mcp>", "args": []}}}
-- It exposes five read-only tools: list_workouts, get_workout_insight (one workout against my own baseline), get_metric_series (day-by-day metric series), get_sleep_detail (one night, stage by stage), and get_data_health (fetch/parse/write state per stream).
+- It exposes six read-only tools: list_workouts, get_workout_insight (one workout against my own baseline), get_metric_series (day-by-day metric series), get_sleep_detail (one night, stage by stage), get_sleep_for_date (sleep sessions for a local date and IANA timezone), and get_data_health (fetch/parse/write state per stream).
 
 Please tell me:
 1. For you specifically — the tool I am talking to right now — which file the config goes in, or which command adds it;

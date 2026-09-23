@@ -8,6 +8,7 @@ reqwest = { version = "0.12", features = ["json", "cookies"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 thiserror = "1.0"
 anyhow = "1.0"
 sha2 = "0.10"

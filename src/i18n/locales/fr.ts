@@ -303,7 +303,7 @@ Ce que j'en sais :
 - Le programme MCP vient de l'archive zeppbridge-tools de la page GitHub Releases de ZeppBridge ; on la décompresse et zeppbridge-mcp est dedans. Je ne l'ai peut-être pas encore téléchargée.
 - C'est un serveur MCP stdio. Il lit la base locale, n'utilise pas le réseau, n'écoute sur aucun port, et n'a besoin ni de jeton ni de clé API.
 - La forme de config typique est : {"mcpServers": {"zeppbridge": {"command": "<chemin complet vers zeppbridge-mcp>", "args": []}}}
-- Il expose cinq outils en lecture seule : list_workouts, get_workout_insight (une séance comparée à ma propre référence), get_metric_series (séries de métriques jour par jour), get_sleep_detail (une nuit, phase par phase), et get_data_health (état récupération/analyse/écriture par flux).
+- Il expose six outils en lecture seule : list_workouts, get_workout_insight (une séance comparée à ma propre référence), get_metric_series (séries de métriques jour par jour), get_sleep_detail (une nuit, phase par phase), get_sleep_for_date (sommeil d’une date locale et d’un fuseau IANA), et get_data_health (état récupération/analyse/écriture par flux).
 
 Dis-moi :
 1. Pour toi précisément — l'outil à qui je parle là — dans quel fichier va la config, ou quelle commande l'ajoute ;

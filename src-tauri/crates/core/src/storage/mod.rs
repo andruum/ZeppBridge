@@ -3817,6 +3817,33 @@ impl Database {
         }))
     }
 
+    /// Return full sleep details whose end instant falls in [start, end).
+    /// The caller defines local-day boundaries and converts them to UTC first.
+    pub fn get_sleep_sessions_ending_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<SleepSession>> {
+        let start = start.to_rfc3339();
+        let end = end.to_rfc3339();
+        let ids = {
+            let mut stmt = self.conn.prepare(
+                "SELECT sleep_id FROM sleep_sessions
+                 WHERE julianday(end_time) >= julianday(?1)
+                   AND julianday(end_time) < julianday(?2)
+                 ORDER BY julianday(end_time) DESC, sleep_id",
+            )?;
+            stmt.query_map(params![start, end], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        ids.iter()
+            .map(|sleep_id| {
+                self.get_sleep_detail(sleep_id)?
+                    .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows.into())
+            })
+            .collect()
+    }
+
     /// 本机一共有多少条运动记录。见 `count_sleep_sessions` 的理由。
     pub fn count_workouts(&self) -> Result<i64> {
         self.conn

@@ -173,6 +173,7 @@ stdio 传输，**不监听任何端口，不发出任何网络请求**。只读�
 | `get_workout_insight` | 一次运动与个人基线的比较、基线窗口、样本数、置信度 |
 | `get_metric_series` | 按天的指标序列，每条带 `unit` |
 | `get_sleep_detail` | 一晚睡眠的明细，分期时长单位分钟 |
+| `get_sleep_for_date` | 按指定 IANA 时区的本地日期查询当日结束的全部睡眠记录 |
 | `get_data_health` | 每条流的抓取/解析/写入状态与覆盖情况 |
 
 `get_data_health` 值得单独说：它让模型能区分「这个问题查不到」是因为没同步，还是因为那段时间本来就没数据。

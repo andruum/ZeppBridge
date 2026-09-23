@@ -13,6 +13,7 @@ zeppbridge-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 axum = "0.8"
 tokio = { workspace = true }
 
