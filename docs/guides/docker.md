@@ -181,7 +181,7 @@ nearly empty, so pass `TZ` and use absolute paths.
 
 ## docker compose
 
-`packaging/docker/docker-compose.yml` starts the authenticated `mcp-http` service
+`packaging/docker/docker-compose.yml` starts the authenticated `zepp-mcp-http` service
 by default. It keeps a named persistent Compose volume for the synced library
 (default volume name: `zeppbridge_data`). No host port is published; port 8080 is
 only exposed to other containers on that Compose network.
@@ -205,7 +205,7 @@ docker compose -f packaging/docker/docker-compose.yml --profile sync run --rm sy
 
 Configure a Coolify scheduled task to run that same command on a cadence you
 choose. The endpoint inside the Compose network is
-`http://mcp-http:8080/mcp`; MCP clients must send
+`http://zepp-mcp-http:8080/mcp`; MCP clients must send
 `Authorization: Bearer <ZEPPBRIDGE_MCP_AUTH_TOKEN>`. Do not publish port 8080
 or add a public domain unless you intentionally place it behind trusted TLS and
 restrict access. The service responds to `/healthz` for private health checks.

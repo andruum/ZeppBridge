@@ -56,7 +56,7 @@ services:
 
   # Default long-running service. It has no Zepp credentials, only a separate
   # bearer token used by MCP clients. No host port is published by this file.
-  mcp-http:
+  zepp-mcp-http:
     <<: *common
     command: ["zeppbridge-mcp", "--http"]
     environment:
