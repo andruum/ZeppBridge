@@ -1,60 +1,79 @@
-# Scheduled sync for a machine that is already on — a NAS, a home server, a VPS.
+# Private HTTP MCP service plus one-shot sync/status commands.
 #
-# Run from the repository root:
-#   docker compose -f packaging/docker/docker-compose.yml run --rm sync
-#
-# Nothing here starts on `docker compose up`. Every service is behind a profile
-# and is a one-shot command, because none of this is a daemon: the CLI syncs and
-# exits. What schedules it is the host — cron, a systemd timer, the NAS task
-# scheduler. Putting cron inside the container would mean a second init system,
-# its own log destination, and a container that looks healthy while doing
-# nothing. See docs/guides/docker.md for the timer.
+# `docker compose up -d` starts only the authenticated HTTP MCP endpoint.
+# Sync is intentionally a profile service: run it from a scheduler with
+# `docker compose --profile sync run --rm sync`.
+# Do not publish port 8080 unless you intentionally configure a trusted TLS
+# reverse proxy and restrict access. `expose` only makes it reachable to other
+# containers on this Compose network.
 
 x-common: &common
   image: zeppbridge:local
   build:
     context: ../..
     dockerfile: packaging/docker/Dockerfile
-  # The uid that owns ./data on the host. Set ZEPPBRIDGE_UID/GID in a .env file
-  # next to this one, or export them; 1000:1000 is the common desktop default.
-  user: "${ZEPPBRIDGE_UID:-1000}:${ZEPPBRIDGE_GID:-1000}"
   volumes:
-    # The whole library: zepp.db, auth.json, exports/, backups/.
-    - ./data:/data
-  environment:
-    ZEPPBRIDGE_DATA_DIR: /data
-    # The App Token, from the desktop app's credential store. Keep it in a .env
-    # file (or a real secret) rather than inline here — a compose file gets
-    # committed, and `docker inspect` shows environment values to anyone who can
-    # reach the daemon.
-    ZEPPBRIDGE_APP_TOKEN: "${ZEPPBRIDGE_APP_TOKEN:?set ZEPPBRIDGE_APP_TOKEN, see docs/guides/docker.md}"
-    ZEPPBRIDGE_CREDENTIAL_STORE: env
-    # Local days are local. Without this the container is UTC and a reading
-    # taken at 00:30 lands on the previous day.
-    TZ: "${TZ:-UTC}"
+    - zeppbridge-data:/data
   restart: "no"
 
 services:
-  # Incremental sync: only what changed since the last run. This is the one to
-  # put on a timer.
+  # Incremental sync. Give the app token and account metadata only to this
+  # container; the MCP service never needs Zepp cloud credentials.
   sync:
     <<: *common
     profiles: ["sync"]
     command: ["zeppbridge-cli", "sync", "--mode", "incremental", "--json"]
+    environment:
+      ZEPPBRIDGE_DATA_DIR: /data
+      ZEPPBRIDGE_CREDENTIAL_STORE: env
+      ZEPPBRIDGE_APP_TOKEN: "${ZEPPBRIDGE_APP_TOKEN-}"
+      ZEPPBRIDGE_USER_ID: "${ZEPPBRIDGE_USER_ID-}"
+      ZEPPBRIDGE_REGION_HOST: "${ZEPPBRIDGE_REGION_HOST-}"
+      TZ: "${TZ:-UTC}"
 
-  # What is in the library right now, and how far back it goes.
   status:
     <<: *common
     profiles: ["status"]
     command: ["zeppbridge-cli", "status", "--json"]
+    environment:
+      ZEPPBRIDGE_DATA_DIR: /data
+      ZEPPBRIDGE_CREDENTIAL_STORE: env
+      ZEPPBRIDGE_APP_TOKEN: "${ZEPPBRIDGE_APP_TOKEN-}"
+      ZEPPBRIDGE_USER_ID: "${ZEPPBRIDGE_USER_ID-}"
+      ZEPPBRIDGE_REGION_HOST: "${ZEPPBRIDGE_REGION_HOST-}"
+      TZ: "${TZ:-UTC}"
 
-  # The read-only MCP server. Listed for completeness, but note it speaks stdio
-  # and listens on no port, so it is not a service you leave running — the MCP
-  # client spawns it. `docker compose run --rm -T mcp` is the shape that works;
-  # docs/guides/docker.md has the client config.
+  # Existing local MCP client transport (stdio), retained for backwards compatibility.
   mcp:
     <<: *common
     profiles: ["mcp"]
     command: ["zeppbridge-mcp"]
     stdin_open: true
     tty: false
+    environment:
+      ZEPPBRIDGE_DATA_DIR: /data
+      TZ: "${TZ:-UTC}"
+
+  # Default long-running service. It has no Zepp credentials, only a separate
+  # bearer token used by MCP clients. No host port is published by this file.
+  mcp-http:
+    <<: *common
+    command: ["zeppbridge-mcp", "--http"]
+    environment:
+      ZEPPBRIDGE_DATA_DIR: /data
+      ZEPPBRIDGE_MCP_HTTP_ADDR: "0.0.0.0:8080"
+      ZEPPBRIDGE_MCP_AUTH_TOKEN: "${ZEPPBRIDGE_MCP_AUTH_TOKEN:?set ZEPPBRIDGE_MCP_AUTH_TOKEN}"
+      TZ: "${TZ:-UTC}"
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  zeppbridge-data:
+    name: "${COMPOSE_PROJECT_NAME:-zeppbridge}_data"

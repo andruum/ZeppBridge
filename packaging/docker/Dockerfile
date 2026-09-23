@@ -1,14 +1,10 @@
 # ZeppBridge headless image: zeppbridge-cli and zeppbridge-mcp.
 #
 # This image deliberately does NOT contain the desktop app. The GUI needs a
-# WebView, a display and a login window; none of that belongs in a container,
-# and pretending otherwise would ship an image that cannot do the one thing
-# people would try first. What is here is the scheduled half — sync on a timer,
-# export on demand, and a read-only MCP server for a local model.
-#
-# Because of that split there is a prerequisite the image cannot remove: an
-# account has to be connected once with the desktop app, and the resulting
-# token has to be handed to the container. See docs/guides/docker.md.
+# WebView, a display and a login window. The MCP binary supports its original
+# stdio transport plus an optional authenticated HTTP transport for Compose.
+# Sync remains a separate CLI job and is the only component that needs Zepp
+# cloud credentials.
 #
 # Build from the repository root:
 #   docker build -f packaging/docker/Dockerfile -t zeppbridge:local .
@@ -65,6 +61,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         libdbus-1-3 \
         tzdata \
     && rm -rf /var/lib/apt/lists/*

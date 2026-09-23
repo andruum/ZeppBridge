@@ -5,9 +5,9 @@
 //!
 //! * **只读**。用 SQLite 的 `query_only` 连接打开，写操作在连接层就被拒绝，
 //!   不靠这个文件里的分支去保证。
-//! * **不联网、不监听**。传输只有 stdio；这个进程不会打开任何端口，也不会
-//!   向 Zepp 发一个请求。要拉新数据请用桌面应用或 `zeppbridge-cli sync`。
-//! * **不吐凭据和本机路径**。返回里没有 token、Cookie、完整账号，也没有
+//! * **不主动访问 Zepp 云**。默认传输是 stdio；可选 HTTP 模式只接收 MCP 请求，
+//!   通过 Bearer token 认证，并且不发布任何端口。同步仍由 `zeppbridge-cli` 负责。
+//! * **不吐凭据和本机路径**。返回里没有 Zepp Token、Cookie、完整账号，也没有
 //!   数据目录的绝对路径——那些对回答健康问题没有帮助，泄漏出去却是实打实的。
 //! * **缺失就是缺失**。没有采样的那一天不会出现在序列里，也不会补 0。
 //!   单位、时区、来源和缺失值的定义全部来自 `zeppbridge_core::contract`，
@@ -30,8 +30,20 @@
 //! 上；只留 modern，今天所有能用的客户端全部连不上。而这个服务本来就是
 //! stateless、stdio、只读的——新协议要求的那些性质它天生就满足。
 
-use std::io::{self, BufRead, Write};
+use std::{
+    io::{self, BufRead, Write},
+    net::SocketAddr,
+    sync::Arc,
+};
 
+use axum::{
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::{json, Value};
 use zeppbridge_core::contract;
 use zeppbridge_core::paths;
@@ -122,9 +134,191 @@ fn read_frame(reader: &mut impl BufRead) -> io::Result<Option<RequestFrame>> {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--http"] || args.as_slice() == ["--transport", "http"] {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("Could not start the async runtime: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = runtime.block_on(serve_http()) {
+            eprintln!("MCP HTTP server failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if !args.is_empty() {
+        eprintln!("Usage: zeppbridge-mcp [--http | --transport http]");
+        std::process::exit(2);
+    }
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let _ = serve(&mut stdin.lock(), &mut stdout.lock());
+    if let Err(error) = serve(&mut stdin.lock(), &mut stdout.lock()) {
+        eprintln!("MCP stdio server failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn serve_http() -> Result<(), Box<dyn std::error::Error>> {
+    const AUTH_TOKEN_ENV: &str = "ZEPPBRIDGE_MCP_AUTH_TOKEN";
+    const HTTP_ADDR_ENV: &str = "ZEPPBRIDGE_MCP_HTTP_ADDR";
+    let token = std::env::var(AUTH_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{AUTH_TOKEN_ENV} must be set for HTTP transport"))?;
+    let address = std::env::var(HTTP_ADDR_ENV)
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .parse::<SocketAddr>()?;
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    eprintln!("ZeppBridge MCP HTTP listening on {address}");
+    axum::serve(listener, http_router(token)).await?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct HttpState {
+    bearer_token: Arc<str>,
+}
+
+fn http_router(token: String) -> Router {
+    Router::new()
+        .route("/mcp", post(http_mcp_post).get(http_mcp_get))
+        .route("/healthz", get(http_healthz))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .with_state(HttpState {
+            bearer_token: Arc::from(token),
+        })
+}
+
+async fn http_healthz() -> &'static str {
+    "ok"
+}
+
+async fn http_mcp_get() -> StatusCode {
+    // Server-to-client event streams are not needed: this stateless service only
+    // replies to requests sent to the POST endpoint.
+    StatusCode::METHOD_NOT_ALLOWED
+}
+
+async fn http_mcp_post(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !supplied
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), state.bearer_token.as_bytes()))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    if headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            !value.split(',').any(|item| {
+                let media_type = item.split(';').next().unwrap_or("").trim();
+                media_type.eq_ignore_ascii_case("application/json") || media_type == "*/*"
+            })
+        })
+    {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    }
+
+    let request_protocol_version = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok());
+    if request_protocol_version.is_some_and(|version| !version_supported(version)) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let response_protocol_version = request_protocol_version.unwrap_or("2025-03-26");
+
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": "Request is not valid JSON or UTF-8" }
+            }))
+            .into_response();
+        }
+    };
+    if !request.is_object() {
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32600, "message": "Request must be a JSON-RPC object" }
+        }))
+        .into_response();
+    }
+
+    let id = request.get("id").cloned();
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return Json(json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "error": { "code": -32600, "message": "Request method is required" }
+        }))
+        .into_response();
+    };
+    let Some(id) = id else {
+        return StatusCode::ACCEPTED.into_response();
+    };
+
+    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    let (payload, result_protocol_version) = match handle(method, &params) {
+        Ok(result) => {
+            let version = result
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .or_else(|| requested_protocol_version(&params))
+                .filter(|version| version_supported(version))
+                .unwrap_or(response_protocol_version)
+                .to_string();
+            (
+                json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                version,
+            )
+        }
+        Err(error) => (
+            json!({ "jsonrpc": "2.0", "id": id, "error": error.to_json() }),
+            response_protocol_version.to_string(),
+        ),
+    };
+    let mut response = Json(payload).into_response();
+    if let Ok(value) = HeaderValue::from_str(&result_protocol_version) {
+        response.headers_mut().insert("mcp-protocol-version", value);
+    }
+    response
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 fn serve(reader: &mut impl BufRead, stdout: &mut impl Write) -> io::Result<()> {
@@ -928,6 +1122,72 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!(MODERN_PROTOCOL_VERSION)));
+    }
+
+    #[tokio::test]
+    async fn http_transport_requires_bearer_auth_and_handles_initialize() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let app = http_router("test-secret-token".to_string());
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#,
+                ))
+                .unwrap()
+        };
+        let unauthorized = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-secret-token")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            authorized.headers().get("mcp-protocol-version").unwrap(),
+            "2025-06-18"
+        );
+        let body = authorized.into_body().collect().await.unwrap().to_bytes();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["result"]["serverInfo"]["name"], "zeppbridge");
+    }
+
+    #[tokio::test]
+    async fn http_transport_acknowledges_notifications_without_a_body() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let response = http_router("test-secret-token".to_string())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-secret-token")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
     }
 
     /// 旧客户端一个字都不用改。这条测试挡的是「升级新协议顺手把老路拆了」。
