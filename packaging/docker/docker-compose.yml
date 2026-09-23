@@ -82,6 +82,8 @@ services:
       TZ: "${TZ:-UTC}"
     expose:
       - "8080"
+    networks:
+      - zeppbridge-mcp-net
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/healthz"]
       interval: 30s
@@ -93,3 +95,9 @@ services:
 volumes:
   zeppbridge-data:
     name: "${COMPOSE_PROJECT_NAME:-zeppbridge}_data"
+
+networks:
+  zeppbridge-mcp-net:
+    name: zeppbridge-mcp-net
+    driver: bridge
+    internal: true

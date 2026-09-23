@@ -182,9 +182,10 @@ nearly empty, so pass `TZ` and use absolute paths.
 ## docker compose
 
 `packaging/docker/docker-compose.yml` starts the authenticated `zepp-mcp-http` service
-by default. It keeps a named persistent Compose volume for the synced library
-(default volume name: `zeppbridge_data`). No host port is published; port 8080 is
-only exposed to other containers on that Compose network.
+and the private `zepp-sync-runner` by default. It keeps a named persistent
+Compose volume for the synced library (default volume name: `zeppbridge_data`).
+The MCP service has no published host port; it is attached to the internal bridge
+network `zeppbridge-mcp-net` only.
 
 Set `ZEPPBRIDGE_MCP_AUTH_TOKEN` in Coolify's protected environment variables,
 then deploy. For local Compose, export a strong random value before running:
@@ -218,11 +219,27 @@ In Coolify, after deploying:
    Use **Execute Now** for the first sync, review its output, then leave the
    schedule enabled for subsequent runs.
 
-The endpoint inside the Compose network is
-`http://zepp-mcp-http:8080/mcp`; MCP clients must send
-`Authorization: Bearer <ZEPPBRIDGE_MCP_AUTH_TOKEN>`. Do not publish port 8080
-or add a public domain unless you intentionally place it behind trusted TLS and
-restrict access. The service responds to `/healthz` for private health checks.
+To let a separate Hermes Compose project reach it, attach only the Hermes
+service to this pre-existing network in Hermes' Compose file (preserve any
+networks it already uses):
+
+```yaml
+networks:
+  zeppbridge-mcp-net:
+    external: true
+    name: zeppbridge-mcp-net
+
+services:
+  hermes:
+    networks:
+      zeppbridge-mcp-net: {}
+```
+
+Deploy ZeppBridge first so it creates the network. From Hermes, use
+`http://zepp-mcp-http:8080/mcp`; configure the same MCP bearer secret in Hermes
+without putting it in the Compose YAML. Do not publish port 8080 or add a public
+domain unless you intentionally place it behind trusted TLS and restrict access.
+The service responds to `/healthz` for private health checks.
 
 ## MCP over stdio (local)
 
