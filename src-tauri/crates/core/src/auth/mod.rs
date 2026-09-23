@@ -147,6 +147,9 @@ pub const CREDENTIAL_STORE_ENV: &str = "ZEPPBRIDGE_CREDENTIAL_STORE";
 
 /// 由环境直接给出的令牌（只读存储）。
 pub const APP_TOKEN_ENV: &str = "ZEPPBRIDGE_APP_TOKEN";
+/// Environment-only account metadata for headless deployments.
+pub const USER_ID_ENV: &str = "ZEPPBRIDGE_USER_ID";
+pub const REGION_HOST_ENV: &str = "ZEPPBRIDGE_REGION_HOST";
 
 /// 文件存储的文件名，放在数据目录里。
 #[cfg(unix)]
@@ -500,6 +503,56 @@ impl std::fmt::Debug for AuthManager {
     }
 }
 
+/// Parse an optional complete environment credential set without ever writing
+/// the token to the data directory. Supplying only the app token continues to
+/// support the existing credential-store flow that uses auth.json metadata.
+fn env_auth_from_values(
+    user_id: Option<&str>,
+    region_host: Option<&str>,
+    app_token: Option<&str>,
+) -> Result<Option<AuthInfo>> {
+    let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
+    let region_host = region_host.map(str::trim).filter(|value| !value.is_empty());
+    if user_id.is_none() && region_host.is_none() {
+        return Ok(None);
+    }
+    let user_id = user_id.ok_or_else(|| {
+        ZeppBridgeError::ConfigError(format!(
+            "{USER_ID_ENV} and {REGION_HOST_ENV} must both be set"
+        ))
+    })?;
+    let region_host = region_host.ok_or_else(|| {
+        ZeppBridgeError::ConfigError(format!(
+            "{USER_ID_ENV} and {REGION_HOST_ENV} must both be set"
+        ))
+    })?;
+    let app_token = app_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ZeppBridgeError::ConfigError(format!(
+                "{APP_TOKEN_ENV} is required with {USER_ID_ENV} and {REGION_HOST_ENV}"
+            ))
+        })?;
+
+    Ok(Some(AuthInfo {
+        app_token: validate_token(app_token)?,
+        user_id: validate_user_id(user_id)?,
+        region_host: normalize_region_host(region_host)?,
+    }))
+}
+
+fn env_auth_from_process() -> Result<Option<AuthInfo>> {
+    let user_id = std::env::var(USER_ID_ENV).ok();
+    let region_host = std::env::var(REGION_HOST_ENV).ok();
+    let app_token = std::env::var(APP_TOKEN_ENV).ok();
+    env_auth_from_values(
+        user_id.as_deref(),
+        region_host.as_deref(),
+        app_token.as_deref(),
+    )
+}
+
 impl AuthManager {
     pub fn new(data_dir: PathBuf) -> Self {
         let credentials = default_credential_backend_in(&data_dir);
@@ -578,6 +631,9 @@ impl AuthManager {
     /// file without a credential is reported as an actionable auth error, not
     /// as a partially populated `AuthInfo`.
     pub fn load_auth(&self) -> Result<Option<AuthInfo>> {
+        if let Some(auth) = env_auth_from_process()? {
+            return Ok(Some(auth));
+        }
         if !self.auth_file.exists() {
             return Ok(None);
         }
@@ -639,6 +695,16 @@ impl AuthManager {
     /// Returns status without exposing the token.  The optional masked value
     /// is deliberately short and suitable for a settings screen.
     pub fn status(&self) -> Result<AuthStatus> {
+        if let Some(auth) = env_auth_from_process()? {
+            return Ok(AuthStatus {
+                configured: true,
+                user_id: Some(auth.user_id),
+                region_host: Some(auth.region_host),
+                token_masked: Some(mask_token(&auth.app_token)),
+                version: None,
+                updated_at: None,
+            });
+        }
         if !self.auth_file.exists() {
             return Ok(AuthStatus {
                 configured: false,
@@ -1260,6 +1326,34 @@ mod tests {
             .map(|worker| worker.join().unwrap())
             .collect();
         assert_eq!(paths.len(), 16);
+    }
+
+    #[test]
+    fn env_auth_requires_complete_values_and_never_persists_the_token() {
+        let auth = env_auth_from_values(
+            Some(" user-42 "),
+            Some(" https://api-mifit.zepp.com/ "),
+            Some(" env-secret-token "),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(auth.user_id, "user-42");
+        assert_eq!(auth.region_host, "https://api-mifit.zepp.com");
+        assert_eq!(auth.app_token, "env-secret-token");
+
+        assert!(env_auth_from_values(Some("user-42"), None, Some("secret"))
+            .unwrap_err()
+            .to_string()
+            .contains("ZEPPBRIDGE_REGION_HOST"));
+        assert!(
+            env_auth_from_values(Some("user-42"), Some("https://api-mifit.zepp.com"), None)
+                .unwrap_err()
+                .to_string()
+                .contains("ZEPPBRIDGE_APP_TOKEN")
+        );
+        assert!(env_auth_from_values(None, None, Some("token"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

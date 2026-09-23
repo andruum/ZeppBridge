@@ -13,14 +13,12 @@ Two images, for two different jobs:
 ## What the runtime image is not
 
 It does not contain the desktop app. The GUI needs a WebView, a display and a
-sign-in window; none of that belongs in a container. So the image cannot sign
-in, and that produces the one prerequisite it cannot remove:
+sign-in window. If you already have the Zepp App Token, user ID and region host,
+headless sync can use those directly; no desktop app or `auth.json` is required.
+See the [connection guide](connection.md) if you need help finding the account
+metadata.
 
-**Connect the account once with the desktop app, then hand the container the
-credentials.** There is no way around this — signing in requires a browser
-window on a real session. See the [connection guide](connection.md).
-
-## Getting the credentials in
+## Legacy credentials from desktop app
 
 Two things have to reach the container: `auth.json` (non-secret metadata — user
 ID and region host) and the App Token (secret).
@@ -72,6 +70,20 @@ safer store, it is nothing at all.
 Once `credentials.json` is there, later runs pick the file store up on their own
 — you do not have to keep passing the variable. Set it once, on the run that
 writes the token.
+
+## Headless credentials via environment
+
+To avoid copying `auth.json` from a desktop install, set all three values in the
+runtime environment (Coolify protected variables are suitable):
+
+- `ZEPPBRIDGE_APP_TOKEN` — secret App Token
+- `ZEPPBRIDGE_USER_ID` — Zepp user ID
+- `ZEPPBRIDGE_REGION_HOST` — API origin such as `https://api-mifit.zepp.com`
+- `ZEPPBRIDGE_CREDENTIAL_STORE=env`
+
+This mode uses the App Token in memory and does not save it into the data volume.
+The values are validated before sync. Do not put actual secrets in Compose files
+or commit a `.env` file.
 
 ## Build and run
 
@@ -169,21 +181,52 @@ nearly empty, so pass `TZ` and use absolute paths.
 
 ## docker compose
 
-`packaging/docker/docker-compose.yml` has `sync`, `status` and `mcp` services.
-Every one is behind a profile and nothing starts on `docker compose up`, because
-none of them is a daemon:
+`packaging/docker/docker-compose.yml` starts the authenticated `zepp-mcp-http` service
+by default. It keeps a named persistent Compose volume for the synced library
+(default volume name: `zeppbridge_data`). No host port is published; port 8080 is
+only exposed to other containers on that Compose network.
+
+Set `ZEPPBRIDGE_MCP_AUTH_TOKEN` in Coolify's protected environment variables,
+then deploy. For local Compose, export a strong random value before running:
 
 ```bash
-export ZEPPBRIDGE_APP_TOKEN=...
-docker compose -f packaging/docker/docker-compose.yml run --rm sync
+export ZEPPBRIDGE_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+docker compose -f packaging/docker/docker-compose.yml up -d --build
 ```
 
-Set `ZEPPBRIDGE_UID`/`ZEPPBRIDGE_GID` in a `.env` file next to it if your uid is
-not 1000.
+Set `ZEPPBRIDGE_APP_TOKEN`, `ZEPPBRIDGE_USER_ID` and
+`ZEPPBRIDGE_REGION_HOST` in the deployment environment for sync. The HTTP MCP
+container is deliberately not given these Zepp credentials.
 
-## MCP
+For a local one-shot run, use:
 
-`zeppbridge-mcp` speaks stdio and listens on no port, so it is not a service you
+```bash
+docker compose -f packaging/docker/docker-compose.yml --profile sync run --rm sync
+```
+
+Coolify's Scheduled Tasks run a command *inside an already-running container*;
+they do not launch `docker compose run`. The Compose file therefore includes a
+separate `zepp-sync-runner` container with Zepp credentials and the same data
+volume. The HTTP MCP container remains credential-free.
+
+In Coolify, after deploying:
+
+1. Open the resource's **Scheduled Tasks** and create a task.
+2. Set the command to `zeppbridge-cli sync --mode incremental --json`.
+3. Select the `zepp-sync-runner` container.
+4. Choose a schedule and timeout. Coolify uses the deployment server's timezone.
+   Use **Execute Now** for the first sync, review its output, then leave the
+   schedule enabled for subsequent runs.
+
+The endpoint inside the Compose network is
+`http://zepp-mcp-http:8080/mcp`; MCP clients must send
+`Authorization: Bearer <ZEPPBRIDGE_MCP_AUTH_TOKEN>`. Do not publish port 8080
+or add a public domain unless you intentionally place it behind trusted TLS and
+restrict access. The service responds to `/healthz` for private health checks.
+
+## MCP over stdio (local)
+
+`zeppbridge-mcp` without the `--http` option speaks stdio and listens on no port, so it is not a service you
 leave running — the MCP client spawns it and talks over the pipe. Point the
 client at a `docker run`:
 

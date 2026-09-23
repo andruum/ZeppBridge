@@ -27,10 +27,14 @@ MSG
   exit 6
 fi
 
-# 2. No account connected. The CLI already exits 3 for this, but from inside a
-#    container "sign in with the desktop app" is not actionable on its own —
-#    the token still has to get in here afterwards.
-if [ ! -f "$data_dir/auth.json" ]; then
+# 2. No account credentials are available (neither auth.json nor the complete
+#    environment set). The CLI also exits 3, but this message lists both
+#    headless and legacy ways to supply them.
+if [ ! -f "$data_dir/auth.json" ] && {
+  [ -z "${ZEPPBRIDGE_APP_TOKEN:-}" ] ||
+  [ -z "${ZEPPBRIDGE_USER_ID:-}" ] ||
+  [ -z "${ZEPPBRIDGE_REGION_HOST:-}" ]
+}; then
   case "${1:-}" in
     # status and the read-only commands are legitimate on an empty library;
     # only warn for the ones that need the cloud.
@@ -40,14 +44,9 @@ if [ ! -f "$data_dir/auth.json" ]; then
           cat >&2 <<MSG
 zeppbridge: no account connected ($data_dir/auth.json is missing).
 
-The container cannot sign in — that needs a browser window. Connect the account
-once with the desktop app, then give this container the resulting credentials:
-
-  1. copy auth.json from the desktop install's data directory into $data_dir
-  2. pass the App Token as ZEPPBRIDGE_APP_TOKEN
-     (or set ZEPPBRIDGE_CREDENTIAL_STORE=file and copy credentials.json too)
-
-docs/guides/docker.md walks through both.
+The container needs either the three Zepp environment variables
+(ZEPPBRIDGE_APP_TOKEN, ZEPPBRIDGE_USER_ID, ZEPPBRIDGE_REGION_HOST) or the
+legacy auth.json plus App Token setup. See docs/guides/docker.md.
 MSG
           ;;
       esac
