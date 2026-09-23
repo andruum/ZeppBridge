@@ -3833,8 +3833,8 @@ impl Database {
                    AND julianday(end_time) < julianday(?2)
                  ORDER BY julianday(end_time) DESC, sleep_id",
             )?;
-            stmt.query_map(params![start, end], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
+            let rows = stmt.query_map(params![start, end], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         ids.iter()
             .map(|sleep_id| {
