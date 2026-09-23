@@ -1,8 +1,9 @@
 # Private HTTP MCP service plus one-shot sync/status commands.
 #
-# `docker compose up -d` starts only the authenticated HTTP MCP endpoint.
-# Sync is intentionally a profile service: run it from a scheduler with
-# `docker compose --profile sync run --rm sync`.
+# `docker compose up -d` starts the authenticated HTTP MCP endpoint and the
+# private sync runner used by Coolify's scheduled tasks.
+# Local one-shot sync uses the `sync` profile. On Coolify, scheduled tasks run
+# inside an already-running container, so target `zepp-sync-runner` instead.
 # Do not publish port 8080 unless you intentionally configure a trusted TLS
 # reverse proxy and restrict access. `expose` only makes it reachable to other
 # containers on this Compose network.
@@ -30,6 +31,21 @@ services:
       ZEPPBRIDGE_USER_ID: "${ZEPPBRIDGE_USER_ID-}"
       ZEPPBRIDGE_REGION_HOST: "${ZEPPBRIDGE_REGION_HOST-}"
       TZ: "${TZ:-UTC}"
+
+  # Coolify scheduled tasks execute inside an already-running container. Keep a
+  # dedicated, credential-bearing runner alive so sync never needs secrets in
+  # the HTTP MCP service; Coolify invokes zeppbridge-cli inside this container.
+  zepp-sync-runner:
+    <<: *common
+    command: ["sleep", "infinity"]
+    environment:
+      ZEPPBRIDGE_DATA_DIR: /data
+      ZEPPBRIDGE_CREDENTIAL_STORE: env
+      ZEPPBRIDGE_APP_TOKEN: "${ZEPPBRIDGE_APP_TOKEN-}"
+      ZEPPBRIDGE_USER_ID: "${ZEPPBRIDGE_USER_ID-}"
+      ZEPPBRIDGE_REGION_HOST: "${ZEPPBRIDGE_REGION_HOST-}"
+      TZ: "${TZ:-UTC}"
+    restart: unless-stopped
 
   status:
     <<: *common

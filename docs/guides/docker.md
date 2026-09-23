@@ -196,15 +196,29 @@ docker compose -f packaging/docker/docker-compose.yml up -d --build
 
 Set `ZEPPBRIDGE_APP_TOKEN`, `ZEPPBRIDGE_USER_ID` and
 `ZEPPBRIDGE_REGION_HOST` in the deployment environment for sync. The HTTP MCP
-container is deliberately not given these Zepp credentials. Run the first sync
-(or schedule subsequent incremental syncs) with:
+container is deliberately not given these Zepp credentials.
+
+For a local one-shot run, use:
 
 ```bash
 docker compose -f packaging/docker/docker-compose.yml --profile sync run --rm sync
 ```
 
-Configure a Coolify scheduled task to run that same command on a cadence you
-choose. The endpoint inside the Compose network is
+Coolify's Scheduled Tasks run a command *inside an already-running container*;
+they do not launch `docker compose run`. The Compose file therefore includes a
+separate `zepp-sync-runner` container with Zepp credentials and the same data
+volume. The HTTP MCP container remains credential-free.
+
+In Coolify, after deploying:
+
+1. Open the resource's **Scheduled Tasks** and create a task.
+2. Set the command to `zeppbridge-cli sync --mode incremental --json`.
+3. Select the `zepp-sync-runner` container.
+4. Choose a schedule and timeout. Coolify uses the deployment server's timezone.
+   Use **Execute Now** for the first sync, review its output, then leave the
+   schedule enabled for subsequent runs.
+
+The endpoint inside the Compose network is
 `http://zepp-mcp-http:8080/mcp`; MCP clients must send
 `Authorization: Bearer <ZEPPBRIDGE_MCP_AUTH_TOKEN>`. Do not publish port 8080
 or add a public domain unless you intentionally place it behind trusted TLS and
