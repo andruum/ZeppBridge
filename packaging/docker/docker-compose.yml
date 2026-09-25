@@ -1,4 +1,4 @@
-# Private read-only and on-demand sync MCP services plus CLI sync/status commands.
+# One MCP service and a private on-demand sync worker plus CLI sync/status commands.
 #
 # `docker compose up -d` starts the authenticated HTTP MCP endpoint and the
 # private sync runner used by Coolify's scheduled tasks.
@@ -47,13 +47,12 @@ services:
       TZ: "${TZ:-UTC}"
     restart: unless-stopped
 
-  # On-demand MCP uses the SAME bearer as the read-only MCP, but only this
-  # service and the scheduled runner receive Zepp Cloud credentials. It needs
-  # private access from Hermes and separate outbound access to Zepp Cloud.
-  # Neither network publishes a host port.
-  zepp-sync-mcp:
+  # Only the original MCP can reach this non-MCP worker on the control network.
+  # This container and the scheduled runner hold the Zepp Cloud credentials.
+  # Both networks are private; neither publishes a host port.
+  zepp-sync-worker:
     <<: *common
-    command: ["python3", "/usr/local/bin/zeppbridge_sync_mcp.py"]
+    command: ["python3", "/usr/local/bin/zeppbridge_sync_worker.py"]
     environment:
       ZEPPBRIDGE_DATA_DIR: /data
       ZEPPBRIDGE_CREDENTIAL_STORE: env
@@ -61,12 +60,12 @@ services:
       ZEPPBRIDGE_USER_ID: "${ZEPPBRIDGE_USER_ID-}"
       ZEPPBRIDGE_REGION_HOST: "${ZEPPBRIDGE_REGION_HOST-}"
       ZEPPBRIDGE_MCP_AUTH_TOKEN: "${ZEPPBRIDGE_MCP_AUTH_TOKEN:?set ZEPPBRIDGE_MCP_AUTH_TOKEN}"
-      ZEPPBRIDGE_SYNC_MCP_ADDR: "0.0.0.0:8081"
+      ZEPPBRIDGE_SYNC_WORKER_ADDR: "0.0.0.0:8081"
       TZ: "${TZ:-UTC}"
     expose:
       - "8081"
     networks:
-      - zeppbridge-mcp-net
+      - zeppbridge-control-net
       - zeppbridge-sync-egress-net
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8081/healthz"]
@@ -99,8 +98,9 @@ services:
       ZEPPBRIDGE_DATA_DIR: /data
       TZ: "${TZ:-UTC}"
 
-  # Default long-running service. It has no Zepp credentials, only a separate
-  # bearer token used by MCP clients. No host port is published by this file.
+  # The only MCP endpoint: read-only SQLite access plus two fixed sync tools.
+  # It has no Zepp Cloud credentials and no host port. Sync is delegated to
+  # the private worker using the same bearer supplied by MCP clients.
   zepp-mcp-http:
     <<: *common
     command: ["zeppbridge-mcp", "--http"]
@@ -108,11 +108,13 @@ services:
       ZEPPBRIDGE_DATA_DIR: /data
       ZEPPBRIDGE_MCP_HTTP_ADDR: "0.0.0.0:8080"
       ZEPPBRIDGE_MCP_AUTH_TOKEN: "${ZEPPBRIDGE_MCP_AUTH_TOKEN:?set ZEPPBRIDGE_MCP_AUTH_TOKEN}"
+      ZEPPBRIDGE_SYNC_WORKER_URL: "http://zepp-sync-worker:8081"
       TZ: "${TZ:-UTC}"
     expose:
       - "8080"
     networks:
       - zeppbridge-mcp-net
+      - zeppbridge-control-net
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/healthz"]
       interval: 30s
@@ -128,6 +130,9 @@ volumes:
 networks:
   zeppbridge-mcp-net:
     name: zeppbridge-mcp-net
+    driver: bridge
+    internal: true
+  zeppbridge-control-net:
     driver: bridge
     internal: true
   zeppbridge-sync-egress-net:

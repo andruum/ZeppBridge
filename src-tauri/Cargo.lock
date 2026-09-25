@@ -6406,6 +6406,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "http-body-util",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",

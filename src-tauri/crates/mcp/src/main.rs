@@ -3,10 +3,11 @@
 //! 让外部模型能查这个人自己的健康数据，而不必先把数据交出去。因此边界画得
 //! 很死：
 //!
-//! * **只读**。用 SQLite 的 `query_only` 连接打开，写操作在连接层就被拒绝，
-//!   不靠这个文件里的分支去保证。
-//! * **不主动访问 Zepp 云**。默认传输是 stdio；可选 HTTP 模式只接收 MCP 请求，
-//!   通过 Bearer token 认证，并且不发布任何端口。同步仍由 `zeppbridge-cli` 负责。
+//! * **查询只读**。SQLite 使用 `query_only` 连接；HTTP 传输额外提供两个固定
+//!   的同步控制工具，转发到私有、持有云凭据的 worker。stdio 仍然只有只读工具。
+//! * **MCP 不直接访问 Zepp 云**。默认传输是 stdio；可选 HTTP 模式使用
+//!   Bearer token 认证，不发布主机端口。实际同步只由 worker 中的
+//!   `zeppbridge-cli` 执行，MCP 进程不接收 Zepp Cloud 凭据。
 //! * **不吐凭据和本机路径**。返回里没有 Zepp Token、Cookie、完整账号，也没有
 //!   数据目录的绝对路径——那些对回答健康问题没有帮助，泄漏出去却是实打实的。
 //! * **缺失就是缺失**。没有采样的那一天不会出现在序列里，也不会补 0。
@@ -14,8 +15,7 @@
 //!   和 GUI、CLI、Local API 是同一份。
 //!
 //! 协议是 MCP 的 JSON-RPC 2.0 over stdio：一行一条消息。手写而不是引入
-//! SDK，是因为这里只需要几个只读方法，而一个只读工具服务不值得为此拖进
-//! 一整套运行时。
+//! SDK，是因为这里只需要少数固定工具和协议方法，不值得引入一整套运行时。
 //!
 //! **双时代（dual-era）。** 2026-07-28 那一版把 `initialize` / `initialized`
 //! 握手整个取消了：版本、身份和能力改为每一次请求自己带在 `_meta` 里，并
@@ -34,6 +34,7 @@ use std::{
     io::{self, BufRead, Write},
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -96,6 +97,10 @@ const ERR_DATABASE: i64 = -32002;
 const ERR_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const SYNC_WORKER_URL_ENV: &str = "ZEPPBRIDGE_SYNC_WORKER_URL";
+const WORKER_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_WORKER_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_SAFE_WORKER_STRING: usize = 128;
 
 enum RequestFrame {
     Message(Vec<u8>),
@@ -194,16 +199,86 @@ async fn serve_http() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Clone)]
 struct HttpState {
     bearer_token: Arc<str>,
+    sync_worker: Option<Arc<SyncWorker>>,
 }
 
 fn http_router(token: String) -> Router {
+    let sync_worker = std::env::var(SYNC_WORKER_URL_ENV)
+        .ok()
+        .and_then(|url| SyncWorker::new(url, token.clone()))
+        .map(Arc::new);
+    http_router_with_worker(token, sync_worker)
+}
+
+fn http_router_with_worker(token: String, sync_worker: Option<Arc<SyncWorker>>) -> Router {
     Router::new()
         .route("/mcp", post(http_mcp_post).get(http_mcp_get))
         .route("/healthz", get(http_healthz))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(HttpState {
             bearer_token: Arc::from(token),
+            sync_worker,
         })
+}
+
+#[derive(Clone)]
+struct SyncWorker {
+    base_url: Arc<str>,
+    bearer_token: Arc<str>,
+    client: reqwest::Client,
+}
+
+impl SyncWorker {
+    fn new(base_url: String, bearer_token: String) -> Option<Self> {
+        let parsed = reqwest::Url::parse(base_url.trim()).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(WORKER_TIMEOUT)
+            .timeout(WORKER_TIMEOUT)
+            .build()
+            .ok()?;
+        Some(Self {
+            base_url: Arc::from(base_url.trim().trim_end_matches('/').to_string()),
+            bearer_token: Arc::from(bearer_token),
+            client,
+        })
+    }
+
+    async fn request(&self, endpoint: &str, method: reqwest::Method) -> Value {
+        let url = format!("{}/{}", self.base_url, endpoint);
+        let request = self
+            .client
+            .request(method, url)
+            .bearer_auth(self.bearer_token.as_ref());
+        let mut response = match request.send().await {
+            Ok(response) if response.status().is_success() => response,
+            _ => return json!({ "status": "failed", "error": "worker_unavailable" }),
+        };
+
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if body.len() + chunk.len() <= MAX_WORKER_RESPONSE_BYTES => {
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(Some(_)) | Err(_) => {
+                    return json!({ "status": "failed", "error": "worker_unavailable" });
+                }
+                Ok(None) => break,
+            }
+        }
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(payload) => sanitize_worker_payload(payload),
+            Err(_) => json!({ "status": "failed", "error": "worker_invalid_response" }),
+        }
+    }
 }
 
 async fn http_healthz() -> &'static str {
@@ -297,25 +372,26 @@ async fn http_mcp_post(
     };
 
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-    let (payload, result_protocol_version) = match handle(method, &params) {
-        Ok(result) => {
-            let version = result
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .or_else(|| requested_protocol_version(&params))
-                .filter(|version| version_supported(version))
-                .unwrap_or(response_protocol_version)
-                .to_string();
-            (
-                json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                version,
-            )
-        }
-        Err(error) => (
-            json!({ "jsonrpc": "2.0", "id": id, "error": error.to_json() }),
-            response_protocol_version.to_string(),
-        ),
-    };
+    let (payload, result_protocol_version) =
+        match handle_http(method, &params, state.sync_worker).await {
+            Ok(result) => {
+                let version = result
+                    .get("protocolVersion")
+                    .and_then(Value::as_str)
+                    .or_else(|| requested_protocol_version(&params))
+                    .filter(|version| version_supported(version))
+                    .unwrap_or(response_protocol_version)
+                    .to_string();
+                (
+                    json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    version,
+                )
+            }
+            Err(error) => (
+                json!({ "jsonrpc": "2.0", "id": id, "error": error.to_json() }),
+                response_protocol_version.to_string(),
+            ),
+        };
     let mut response = Json(payload).into_response();
     if let Ok(value) = HeaderValue::from_str(&result_protocol_version) {
         response.headers_mut().insert("mcp-protocol-version", value);
@@ -642,6 +718,229 @@ fn modern_result(mut result: Value) -> Value {
     result
 }
 
+fn safe_worker_string(value: &Value) -> Option<String> {
+    let text = value.as_str()?;
+    if text.is_empty()
+        || text.len() > MAX_SAFE_WORKER_STRING
+        || !text.is_ascii()
+        || text.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+fn safe_worker_integer(value: &Value) -> Option<i64> {
+    let number = value.as_i64()?;
+    (0..=i64::from(i32::MAX))
+        .contains(&number)
+        .then_some(number)
+}
+
+fn sanitize_worker_payload(payload: Value) -> Value {
+    let Some(input) = payload.as_object() else {
+        return json!({ "status": "failed", "error": "worker_invalid_response" });
+    };
+    let status = match input.get("status").and_then(Value::as_str) {
+        Some(status)
+            if matches!(
+                status,
+                "idle" | "running" | "complete" | "failed" | "partial" | "busy"
+            ) =>
+        {
+            status
+        }
+        _ => "failed",
+    };
+    let mut output = serde_json::Map::new();
+    output.insert("status".into(), json!(status));
+
+    for key in ["job_id", "started_at", "finished_at"] {
+        if let Some(value) = input.get(key).and_then(safe_worker_string) {
+            output.insert(key.into(), json!(value));
+        }
+    }
+    for key in ["records_written", "exit_code"] {
+        if let Some(value) = input.get(key).and_then(safe_worker_integer) {
+            output.insert(key.into(), json!(value));
+        }
+    }
+    if let Some(value) = input.get("coalesced").and_then(Value::as_bool) {
+        output.insert("coalesced".into(), json!(value));
+    }
+    if let Some(value) = input.get("success").and_then(Value::as_bool) {
+        output.insert("success".into(), json!(value));
+    }
+    if let Some(streams) = input.get("streams").and_then(Value::as_array) {
+        let safe_streams: Vec<Value> = streams
+            .iter()
+            .filter_map(|stream| {
+                let stream = stream.as_object()?;
+                let name = stream.get("stream").and_then(safe_worker_string)?;
+                let stream_status = stream.get("status").and_then(safe_worker_string)?;
+                let mut safe = json!({ "stream": name, "status": stream_status });
+                if let Some(records) = stream.get("records_written").and_then(safe_worker_integer) {
+                    safe["records_written"] = json!(records);
+                }
+                Some(safe)
+            })
+            .collect();
+        output.insert("streams".into(), json!(safe_streams));
+    }
+    if let Some(error) = input.get("error").and_then(Value::as_str) {
+        let safe_error = match error {
+            "sync_timeout"
+            | "sync_execution_failed"
+            | "sync_start_failed"
+            | "worker_unavailable"
+            | "worker_invalid_response" => error,
+            _ => "worker_error",
+        };
+        output.insert("error".into(), json!(safe_error));
+    }
+    Value::Object(output)
+}
+
+fn http_tool_definitions(sync_enabled: bool) -> Vec<Value> {
+    let mut tools = tool_definitions();
+    if sync_enabled {
+        tools.extend(sync_tool_definitions());
+    }
+    tools
+}
+
+fn sync_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "sync_zepp",
+            "description": "Start one incremental Zepp Cloud to local ZeppBridge sync through the private worker. Use get_sync_status to check the sanitized job status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "get_sync_status",
+            "description": "Read the latest sanitized on-demand Zepp sync job status from the private worker.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
+
+fn http_instructions(sync_enabled: bool) -> String {
+    let privacy = if sync_enabled {
+        "Authenticated HTTP provides read-only health queries and fixed incremental sync controls through a private worker. The MCP process holds no Zepp Cloud credentials."
+    } else {
+        "Authenticated HTTP provides read-only health queries. Sync controls are disabled because no private worker is configured."
+    };
+    format!(
+        "{privacy}\nTime: {MCP_TIME_CONVENTION}\nMissing values: {MCP_MISSING_VALUE_CONVENTION}\nSources: {MCP_SOURCE_CONVENTION}"
+    )
+}
+
+async fn call_http_tool(
+    params: &Value,
+    sync_worker: Option<Arc<SyncWorker>>,
+) -> Result<Value, (i64, String)> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or((ERR_INVALID_PARAMS, "Missing tool name.".to_string()))?;
+    if matches!(name, "sync_zepp" | "get_sync_status") {
+        let Some(worker) = sync_worker else {
+            return Err((ERR_METHOD_NOT_FOUND, format!("Unknown tool: {name}")));
+        };
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !arguments.is_object() {
+            return Err((ERR_INVALID_PARAMS, "arguments must be an object".into()));
+        }
+        if !arguments.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Err((ERR_INVALID_PARAMS, "This tool takes no arguments".into()));
+        }
+        let payload = if name == "sync_zepp" {
+            worker.request("sync", reqwest::Method::POST).await
+        } else {
+            worker.request("status", reqwest::Method::GET).await
+        };
+        return Ok(mcp_tool_result(payload));
+    }
+    call_tool(params)
+}
+
+async fn handle_http(
+    method: &str,
+    params: &Value,
+    sync_worker: Option<Arc<SyncWorker>>,
+) -> Result<Value, RpcError> {
+    let sync_enabled = sync_worker.is_some();
+    if method == "server/discover" {
+        if let Some(version) = requested_protocol_version(params) {
+            if !version_supported(version) {
+                return Err(unsupported_version_error(version));
+            }
+        }
+        return Ok(modern_result(json!({
+            "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+            "capabilities": { "tools": {} },
+            "instructions": http_instructions(sync_enabled),
+            "ttlMs": LIST_TTL_MS,
+            "cacheScope": "public",
+        })));
+    }
+    if let Some(version) = requested_protocol_version(params) {
+        if !version_supported(version) {
+            return Err(unsupported_version_error(version));
+        }
+        return match method {
+            "tools/list" => Ok(modern_result(json!({
+                "tools": http_tool_definitions(sync_enabled),
+                "ttlMs": LIST_TTL_MS,
+                "cacheScope": "public",
+            }))),
+            "tools/call" => call_http_tool(params, sync_worker)
+                .await
+                .map(modern_result)
+                .map_err(RpcError::from),
+            other => Err(RpcError::new(
+                ERR_METHOD_NOT_FOUND,
+                format!("Unsupported method: {other}. This server provides only declared tools."),
+            )),
+        };
+    }
+    match method {
+        "initialize" => {
+            let requested = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .filter(|version| version_supported(version))
+                .unwrap_or(LEGACY_PROTOCOL_VERSION);
+            Ok(json!({
+                "protocolVersion": requested,
+                "capabilities": { "tools": {} },
+                "serverInfo": server_info(),
+                "instructions": http_instructions(sync_enabled),
+            }))
+        }
+        "notifications/initialized" | "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": http_tool_definitions(sync_enabled) })),
+        "tools/call" => call_http_tool(params, sync_worker)
+            .await
+            .map_err(RpcError::from),
+        other => Err(RpcError::new(
+            ERR_METHOD_NOT_FOUND,
+            format!("Unsupported method: {other}. This server provides only declared tools."),
+        )),
+    }
+}
+
 fn handle(method: &str, params: &Value) -> Result<Value, RpcError> {
     // `server/discover` 本身就是 modern 的入口，也是 stdio 上的时代探针：
     // 客户端拿它试一下，认得就是 modern 服务器，报未知方法就退回 initialize。
@@ -855,6 +1154,18 @@ fn open_db() -> Result<(Database, u64), (i64, String)> {
     let db = Database::open_read_only(db_path)
         .map_err(|error| (ERR_DATABASE, english_diagnostic(error.user_message())))?;
     Ok((db, bytes))
+}
+
+fn mcp_tool_result(payload: Value) -> Value {
+    let is_error = payload["status"]
+        .as_str()
+        .is_some_and(|status| matches!(status, "failed" | "partial" | "busy"));
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into());
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": payload,
+        "isError": is_error
+    })
 }
 
 fn call_tool(params: &Value) -> Result<Value, (i64, String)> {
@@ -1093,14 +1404,7 @@ fn execute_tool_with_db(
         }
     };
 
-    // MCP 的 content 是给模型读的文本；结构化数据同时放进 structuredContent，
-    // 让能用结构的客户端不必再解析一遍字符串。
-    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into());
-    Ok(json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": payload,
-        "isError": false
-    }))
+    Ok(mcp_tool_result(payload))
 }
 
 #[cfg(test)]
@@ -1554,6 +1858,224 @@ mod tests {
     }
 
     /// 旧客户端一个字都不用改。这条测试挡的是「升级新协议顺手把老路拆了」。
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    async fn mcp_http_request(app: axum::Router, request: Value) -> (StatusCode, Value) {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-secret-token")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[derive(Clone)]
+    struct WorkerRequestLog(Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    async fn fake_worker_sync(
+        State(log): State<WorkerRequestLog>,
+        headers: HeaderMap,
+    ) -> Json<Value> {
+        log.0.lock().unwrap().push((
+            "POST /sync".into(),
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .into(),
+        ));
+        Json(json!({
+            "status": "complete",
+            "job_id": "job-1",
+            "secret": "worker-body-must-not-be-forwarded"
+        }))
+    }
+
+    async fn fake_worker_status(
+        State(log): State<WorkerRequestLog>,
+        headers: HeaderMap,
+    ) -> Json<Value> {
+        log.0.lock().unwrap().push((
+            "GET /status".into(),
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .into(),
+        ));
+        Json(json!({ "status": "running", "job_id": "job-1" }))
+    }
+
+    #[tokio::test]
+    async fn configured_http_worker_adds_tools_and_forwards_bounded_requests() {
+        use axum::routing::{get, post};
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = Router::new()
+            .route("/sync", post(fake_worker_sync))
+            .route("/status", get(fake_worker_status))
+            .with_state(WorkerRequestLog(log.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let worker_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, worker).await;
+        });
+        let _worker_url = EnvGuard::set("ZEPPBRIDGE_SYNC_WORKER_URL", &base_url);
+
+        let app = http_router("test-secret-token".to_string());
+        let (_, listed) = mcp_http_request(
+            app.clone(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 8);
+        assert!(names.contains(&"sync_zepp"));
+        assert!(names.contains(&"get_sync_status"));
+
+        let (_, synced) = mcp_http_request(
+            app.clone(),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sync_zepp","arguments":{}}}),
+        )
+        .await;
+        assert_eq!(synced["result"]["structuredContent"]["status"], "complete");
+        assert_eq!(synced["result"]["isError"], false);
+        assert!(
+            synced
+                .to_string()
+                .contains("worker-body-must-not-be-forwarded")
+                == false
+        );
+
+        let (_, status) = mcp_http_request(
+            app,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_sync_status","arguments":{}}}),
+        )
+        .await;
+        assert_eq!(status["result"]["structuredContent"]["status"], "running");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                ("POST /sync".into(), "Bearer test-secret-token".into()),
+                ("GET /status".into(), "Bearer test-secret-token".into()),
+            ]
+        );
+        worker_task.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_tools_reject_nonempty_arguments_as_rpc_errors() {
+        let _worker_url = EnvGuard::set("ZEPPBRIDGE_SYNC_WORKER_URL", "http://127.0.0.1:9");
+        let (_, response) = mcp_http_request(
+            http_router("test-secret-token".to_string()),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sync_zepp","arguments":{"mode":"history"}}}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], ERR_INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn unavailable_worker_is_a_sanitized_error_tool_result() {
+        let _worker_url = EnvGuard::set("ZEPPBRIDGE_SYNC_WORKER_URL", "http://127.0.0.1:9");
+        let (_, response) = mcp_http_request(
+            http_router("test-secret-token".to_string()),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_sync_status","arguments":{}}}),
+        )
+        .await;
+        assert!(response["error"].is_null());
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"],
+            json!({"status":"failed","error":"worker_unavailable"})
+        );
+        assert!(!response.to_string().contains("127.0.0.1:9"));
+    }
+
+    #[tokio::test]
+    async fn http_unknown_method_does_not_claim_the_endpoint_is_read_only() {
+        let worker =
+            SyncWorker::new("http://127.0.0.1:9".into(), "test-secret-token".into()).map(Arc::new);
+        let app = http_router_with_worker("test-secret-token".into(), worker);
+        for params in [
+            json!({}),
+            json!({"_meta": {"io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION}}),
+        ] {
+            let (_, reply) = mcp_http_request(
+                app.clone(),
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "unknown/method", "params": params
+                }),
+            )
+            .await;
+            assert_eq!(reply["error"]["code"], ERR_METHOD_NOT_FOUND);
+            let message = reply["error"]["message"].as_str().unwrap();
+            assert!(!message.contains("only provides read-only tools"));
+        }
+    }
+
+    #[test]
+    fn http_instructions_describe_the_actual_network_and_sync_boundary() {
+        let with_sync = http_instructions(true);
+        assert!(with_sync.contains("fixed incremental sync"));
+        assert!(!with_sync.contains(MCP_PRIVACY_NOTE));
+        let without_sync = http_instructions(false);
+        assert!(!without_sync.contains(MCP_PRIVACY_NOTE));
+        assert!(without_sync.contains("read-only"));
+    }
+
+    #[test]
+    fn stdio_tool_surface_stays_read_only_when_worker_url_is_configured() {
+        let _worker_url = EnvGuard::set("ZEPPBRIDGE_SYNC_WORKER_URL", "http://worker:8081");
+        let listed = handle("tools/list", &json!({})).unwrap();
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 6);
+        assert!(!names.contains(&"sync_zepp"));
+        assert!(!names.contains(&"get_sync_status"));
+    }
+
     #[test]
     fn a_legacy_initialize_still_works_and_echoes_a_version_it_asked_for() {
         let result = handle(

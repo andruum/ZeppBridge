@@ -3,8 +3,8 @@
 # This image deliberately does NOT contain the desktop app. The GUI needs a
 # WebView, a display and a login window. The MCP binary supports its original
 # stdio transport plus an optional authenticated HTTP transport for Compose.
-# Sync remains a separate CLI job. The private sync MCP sidecar invokes that
-# fixed command and holds cloud credentials; the read-only MCP never does.
+# The original MCP delegates fixed sync requests to a private credential-bearing
+# worker. The MCP process itself never receives Zepp Cloud credentials.
 #
 # Build from the repository root:
 #   docker build -f packaging/docker/Dockerfile -t zeppbridge:local .
@@ -19,6 +19,7 @@ FROM rust:1-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libdbus-1-dev \
+        libssl-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -69,7 +70,7 @@ RUN apt-get update \
 
 COPY --from=build /src/src-tauri/target/release/zeppbridge-cli /usr/local/bin/
 COPY --from=build /src/src-tauri/target/release/zeppbridge-mcp /usr/local/bin/
-COPY packaging/docker/sync_mcp.py /usr/local/bin/zeppbridge_sync_mcp.py
+COPY packaging/docker/sync_worker.py /usr/local/bin/zeppbridge_sync_worker.py
 COPY packaging/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # A fixed, unprivileged uid. 1000 is the first uid most desktop Linux users

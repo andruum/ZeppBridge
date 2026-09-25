@@ -181,11 +181,12 @@ nearly empty, so pass `TZ` and use absolute paths.
 
 ## docker compose
 
-`packaging/docker/docker-compose.yml` starts the authenticated `zepp-mcp-http` service
-and the private `zepp-sync-runner` by default. It keeps a named persistent
-Compose volume for the synced library (default volume name: `zeppbridge_data`).
-The MCP service has no published host port; it is attached to the internal bridge
-network `zeppbridge-mcp-net` only.
+`packaging/docker/docker-compose.yml` starts the authenticated `zepp-mcp-http`
+service, private `zepp-sync-worker`, and scheduled-task `zepp-sync-runner` by
+default. It keeps a named persistent Compose volume for the synced library
+(default volume name: `zeppbridge_data`). The MCP service has no published host
+port; Hermes reaches it on `zeppbridge-mcp-net`, while the worker is reachable
+only on a separate internal control network.
 
 Set `ZEPPBRIDGE_MCP_AUTH_TOKEN` in Coolify's protected environment variables,
 then deploy. For local Compose, export a strong random value before running:
@@ -241,40 +242,28 @@ without putting it in the Compose YAML. Do not publish port 8080 or add a public
 domain unless you intentionally place it behind trusted TLS and restrict access.
 The service responds to `/healthz` for private health checks.
 
-### On-demand sync MCP (private)
+### On-demand sync through the original MCP
 
-The Compose deployment also starts `zepp-sync-mcp` at
-`http://zepp-sync-mcp:8081/mcp` on `zeppbridge-mcp-net`. It reuses the **same**
-`ZEPPBRIDGE_MCP_AUTH_TOKEN` as the read-only endpoint; do not create a second
-MCP token. Unlike `zepp-mcp-http`, this separate service receives the Zepp
-app credentials and joins `zeppbridge-sync-egress-net` to reach Zepp Cloud.
-It shares the existing named data volume and has **no published host port**.
-Do not add a public domain or host port for it. The read-only MCP retains its
-read-only database connection and receives no cloud credentials.
+`zepp-mcp-http` is the **only MCP endpoint**. Alongside the six existing
+read-only tools, its authenticated HTTP transport exposes `sync_zepp` and
+`get_sync_status` using the existing `ZEPPBRIDGE_MCP_AUTH_TOKEN`.
+The stdio transport remains read-only. Keep the existing `zeppbridge` MCPorter
+entry at `http://zepp-mcp-http:8080/mcp`; no second MCP client entry is needed.
 
-Register a second MCPorter server for Hermes (retain the existing `zeppbridge`
-entry); store only an environment reference to the existing MCP bearer:
+The MCP forwards those two fixed operations to `zepp-sync-worker` over a
+separate internal `zeppbridge-control-net`. This worker is **not an MCP
+endpoint**; it is accessible only to the MCP container, holds the Zepp Cloud
+credentials, and has a separate egress network for Zepp Cloud. The MCP
+container receives no cloud credential environment variables. Neither
+service publishes a host port or a public domain.
 
-```json
-{
-  "zeppbridge-sync": {
-    "baseUrl": "http://zepp-sync-mcp:8081/mcp",
-    "headers": { "Authorization": "Bearer ${ZEPPBRIDGE_MCP_AUTH_TOKEN}" }
-  }
-}
-```
-
-Adapt the surrounding config object to the local MCPorter version and verify
-with `mcporter list zeppbridge-sync --schema --json`. Permit this mutating tool
-only in trusted interactive sessions, not in automated webhooks. Calling
-`sync_zepp` starts a fixed **incremental** CLI sync and returns a job ID right
-away. `get_sync_status` returns the latest job's state (`running`, `complete`,
-`busy`, `partial`, or `failed`) plus sanitized counts. Concurrent requests
-reuse the running job, and immediate repeats are coalesced. Do not interpret
-`complete` as proof of new sleep data: query `get_sleep_for_date` on the
-read-only `zeppbridge` server after completion. A cross-process lock conflict
-(`busy`) means retry later; partial stream failures are not success. The
-endpoint cannot force the watch/app to upload readings to Zepp Cloud.
+Calling `zeppbridge.sync_zepp` starts a fixed **incremental** CLI sync and
+returns a job ID right away. Poll `zeppbridge.get_sync_status` to check the
+same job. Concurrent requests reuse the running job, and immediate repeats
+are coalesced. Do not interpret `complete` as proof of new sleep data: query
+`get_sleep_for_date` after completion. A cross-process lock conflict (`busy`)
+means retry later; partial stream failures are not success. The endpoint
+cannot force the watch/app to upload readings to Zepp Cloud.
 
 
 ## MCP over stdio (local)
