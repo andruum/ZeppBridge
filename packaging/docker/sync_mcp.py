@@ -168,7 +168,8 @@ def handle_rpc(request: dict, manager: SyncManager) -> dict:
     modern = version is not None or method == "server/discover"
     if method == "server/discover":
         return _modern_result({"supportedVersions": sorted(SUPPORTED_VERSIONS, reverse=True),
-                               "capabilities": {"tools": {}}, "ttlMs": 3_600_000})
+                               "capabilities": {"tools": {}}, "ttlMs": 3_600_000,
+                               "cacheScope": "public"})
     if method == "initialize":
         if modern:
             raise RpcError(-32601, "initialize is not available in modern MCP")
@@ -185,7 +186,8 @@ def handle_rpc(request: dict, manager: SyncManager) -> dict:
         return {}
     if method == "tools/list":
         result = {"tools": TOOLS}
-        return _modern_result({**result, "ttlMs": 3_600_000}) if modern else result
+        return _modern_result({**result, "ttlMs": 3_600_000,
+                               "cacheScope": "public"}) if modern else result
     if method == "tools/call":
         if not isinstance(params, dict) or not isinstance(params.get("arguments", {}), dict):
             raise RpcError(-32602, "Tool arguments must be an object")

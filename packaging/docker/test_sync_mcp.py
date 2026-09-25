@@ -207,9 +207,11 @@ class HttpProtocolTests(unittest.TestCase):
         modern = {"_meta": {sync_mcp.MODERN_VERSION_KEY: "2026-07-28"}}
         _, discovered = self.request("server/discover", modern)
         self.assertEqual(discovered["result"]["resultType"], "complete")
+        self.assertEqual(discovered["result"]["cacheScope"], "public")
         self.assertIn("2026-07-28", discovered["result"]["supportedVersions"])
         _, listed = self.request("tools/list", modern)
         self.assertEqual(listed["result"]["resultType"], "complete")
+        self.assertEqual(listed["result"]["cacheScope"], "public")
         self.assertEqual(listed["result"]["_meta"][sync_mcp.MODERN_INFO_KEY]["name"], "zeppbridge-sync")
         _, status = self.request("tools/call", {"name": "get_sync_status", "arguments": {}, **modern})
         self.assertEqual(status["result"]["resultType"], "complete")
